@@ -1,34 +1,35 @@
 #!/usr/bin/env python3
 """
-Complete Raspberry Pi Companion Node for TurtleBot Human Following (Phase 2):
------------------------------------------------------------------------------
-1. Low-Latency Camera Streaming (Hardware MJPG, Zero-Lag capture loop)
-2. Robot Motion Command Bridge (/cmd_vel HTTP POST & UDP port 8888)
-   - Forwards commands to ROS 1 topic '/cmd_vel' (geometry_msgs/Twist)
-   - Forwards commands to ROS 2 topic '/cmd_vel' (geometry_msgs/Twist)
-   - Fallback: Writes directly to OpenCR controller via Serial (/dev/ttyACM0)
-3. Onboard Safety Heartbeat (stops physical motors if laptop disconnects for >0.6s)
-4. Built-in Hardware Motor Test (/test_motors endpoint & --test CLI flag)
+Raspberry Pi companion node for the TurtleBot human follower. Pure UDP, nothing is hosted.
+
+    in   UDP :8888   "V:<m/s>,W:<rad/s>,S:<seq>"  velocity, also the heartbeat
+    in   UDP :8888   "HELLO"                      the laptop announces where to send video
+    out  UDP -> laptop  JPEG frames in datagrams, plus a small status packet at 2 Hz
+
+Velocity goes to ROS 2 (or ROS 1) /cmd_vel, with OpenCR serial as a last resort.
+If no packet arrives for 0.6 s the wheels are stopped.
+
+    python3 pi_turtlebot_node.py                 camera + motors
+    python3 pi_turtlebot_node.py --no-motors     camera and logging only
+    python3 pi_turtlebot_node.py --raw-mjpeg     forward the camera's own MJPEG, no Pi re-encode
+    python3 pi_turtlebot_node.py --test          spin the wheels briefly and exit
 """
 
-import sys
-import os
 import glob
-import time
-import json
+import os
 import socket
+import sys
 import threading
-from flask import Flask, Response, request, jsonify
+import time
 
-# Ensure ROS 2 Domain ID and robot model are set for TurtleBot3 Burger
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import tb_proto
+
 os.environ["ROS_DOMAIN_ID"] = os.environ.get("ROS_DOMAIN_ID", "30")
 os.environ["TURTLEBOT3_MODEL"] = os.environ.get("TURTLEBOT3_MODEL", "burger")
-os.environ["LDS_MODEL"] = os.environ.get("LDS_MODEL", "LDS-01")
+os.environ["LDS_MODEL"] = os.environ.get("LDS_MODEL", "LDS-02")
 os.environ["ROS_LOCALHOST_ONLY"] = "0"
 
-# ---------------------------------------------------------------------------
-# Auto-discover ROS Python paths if not already sourced in current environment
-# ---------------------------------------------------------------------------
 for ros_path in glob.glob('/opt/ros/*/lib/python*/dist-packages') + \
                 glob.glob('/opt/ros/*/local/lib/python*/dist-packages') + \
                 glob.glob('/opt/ros/*/lib/python*/site-packages') + \
@@ -38,25 +39,29 @@ for ros_path in glob.glob('/opt/ros/*/lib/python*/dist-packages') + \
     if ros_path not in sys.path:
         sys.path.append(ros_path)
 
-# Configuration
+NO_MOTORS = "--no-motors" in sys.argv
+RAW_MJPEG = "--raw-mjpeg" in sys.argv
+
 CAMERA_INDEX = 0
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
-TARGET_FPS = 25
-JPEG_QUALITY = 55
-PORT = 5000
-UDP_PORT = 8888
+TARGET_FPS = 30
+JPEG_QUALITY = 50
+CMD_TIMEOUT = 0.35  # about ten missed packets at 30 Hz
+PEER_TIMEOUT = 3.0
+MAX_LINEAR = 0.22   # TurtleBot3 Burger limits
+MAX_ANGULAR = 1.40
 
-# TurtleBot / ROS Configuration
 ROS_MODE = None  # 'ROS1', 'ROS2', or None
 ros_cmd_pub = None
 TwistClass = None
 SERIAL_ENABLED = False
 SERIAL_PORT = "/dev/ttyACM0"
 SERIAL_BAUD = 115200
+serial_conn = None
+
 
 def is_roscore_online():
-    """Fast check to see if roscore is listening on port 11311 without blocking"""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(0.5)
@@ -66,7 +71,7 @@ def is_roscore_online():
     except Exception:
         return False
 
-# 1. Try ROS 1 (rospy)
+
 if is_roscore_online():
     try:
         import rospy
@@ -75,13 +80,10 @@ if is_roscore_online():
         ros_cmd_pub = rospy.Publisher('/cmd_vel', Twist1, queue_size=1)
         TwistClass = Twist1
         ROS_MODE = 'ROS1'
-        print("[TurtleBot Bridge] Successfully connected to ROS 1 topic: /cmd_vel")
+        print("[Pi] Connected to ROS 1 /cmd_vel")
     except Exception as e1:
-        print(f"[TurtleBot Bridge] ROS 1 init error: {e1}")
-else:
-    print("[TurtleBot Bridge] Note: roscore is not running on port 11311.")
+        print(f"[Pi] ROS 1 init error: {e1}")
 
-# 2. If ROS 1 not active, try ROS 2 (rclpy)
 if ROS_MODE is None:
     try:
         import signal
@@ -89,7 +91,6 @@ if ROS_MODE is None:
             signal.signal(signal.SIGHUP, signal.SIG_IGN)
         except Exception:
             pass
-
         import rclpy
         from rclpy.signals import SignalHandlerOptions
         from geometry_msgs.msg import Twist as Twist2
@@ -102,412 +103,406 @@ if ROS_MODE is None:
         TwistClass = Twist2
         ROS_MODE = 'ROS2'
         threading.Thread(target=rclpy.spin, args=(ros2_node,), daemon=True).start()
-        print("[TurtleBot Bridge] Successfully connected to ROS 2 topic: /cmd_vel")
+        print("[Pi] Connected to ROS 2 /cmd_vel")
     except Exception as e2:
-        print(f"[TurtleBot Bridge] ROS 2 init note: {e2}")
+        print(f"[Pi] ROS 2 not available: {e2}")
 
-ROS_ENABLED = (ROS_MODE is not None)
-if not ROS_ENABLED:
-    print("[TurtleBot Bridge WARNING] No active ROS driver found.")
-    print("  -> For physical motors to spin in ROS 2, run in another terminal:")
-    print("     ros2 launch turtlebot3_bringup robot.launch.py")
+ROS_ENABLED = ROS_MODE is not None
+
+# --- LiDAR (/scan) and odometry (/odom), ROS 2 only. Read-only: this never moves the robot. ---
+scan_lock = threading.Lock()
+scan_bins = None      # list of SCAN_BINS ints, millimetres
+scan_time = 0.0
+scan_hz = 0.0
+odom_pose = None      # (x, y, yaw)
 
 
-# 3. Try OpenCR Serial Direct Port (/dev/ttyACM0) if ROS is not active
-serial_conn = None
-if not ROS_ENABLED:
-    for port_candidate in ["/dev/ttyACM0", "/dev/ttyACM1", "/dev/ttyUSB0"]:
+def _scan_cb(msg):
+    global scan_bins, scan_time, scan_hz
+    import numpy as np
+    r = np.asarray(msg.ranges, dtype=np.float32)
+    ang = msg.angle_min + np.arange(r.size, dtype=np.float32) * msg.angle_increment
+    ok = np.isfinite(r) & (r >= max(msg.range_min, 0.05)) & (r <= msg.range_max)
+    if not ok.any():
+        return
+    idx = (np.mod(ang[ok], 2 * np.pi) / (2 * np.pi) * tb_proto.SCAN_BINS).astype(np.int32) % tb_proto.SCAN_BINS
+    mm = np.full(tb_proto.SCAN_BINS, 65535, dtype=np.uint32)
+    np.minimum.at(mm, idx, (r[ok] * 1000).astype(np.uint32))
+    mm[mm == 65535] = 0
+    now = time.monotonic()
+    with scan_lock:
+        if scan_time:
+            scan_hz = 0.8 * scan_hz + 0.2 / max(now - scan_time, 1e-3)
+        scan_bins = [int(v) for v in mm]
+        scan_time = now
+
+
+def _odom_cb(msg):
+    global odom_pose
+    import math
+    q = msg.pose.pose.orientation
+    yaw = math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
+    with scan_lock:
+        odom_pose = (msg.pose.pose.position.x, msg.pose.pose.position.y, yaw)
+
+
+if ROS_MODE == 'ROS2':
+    try:
+        from rclpy.qos import qos_profile_sensor_data
+        from sensor_msgs.msg import LaserScan
+        from nav_msgs.msg import Odometry
+        ros2_node.create_subscription(LaserScan, '/scan', _scan_cb, qos_profile_sensor_data)
+        ros2_node.create_subscription(Odometry, '/odom', _odom_cb, qos_profile_sensor_data)
+        print("[Pi] Subscribed to /scan and /odom")
+    except Exception as e:
+        print(f"[Pi] LiDAR subscriptions failed: {e}")
+
+if NO_MOTORS:
+    print("[Pi] --no-motors: /cmd_vel and OpenCR serial are never written.")
+elif not ROS_ENABLED:
+    print("[Pi] No ROS found. Trying OpenCR serial. For ROS 2: ros2 launch turtlebot3_bringup robot.launch.py")
+    for candidate in ["/dev/ttyACM0", "/dev/ttyACM1", "/dev/ttyUSB0"]:
         try:
             import serial
-            serial_conn = serial.Serial(port_candidate, SERIAL_BAUD, timeout=0.1)
+            serial_conn = serial.Serial(candidate, SERIAL_BAUD, timeout=0.1)
             SERIAL_ENABLED = True
-            SERIAL_PORT = port_candidate
-            print(f"[TurtleBot Bridge] OpenCR direct serial connected on {SERIAL_PORT}")
+            SERIAL_PORT = candidate
+            print(f"[Pi] OpenCR serial on {SERIAL_PORT}")
             break
         except Exception:
             continue
 
-app = Flask(__name__)
 
-# --- Threaded Low-Latency Camera ---
-class ThreadedCamera:
-    def __init__(self, src=CAMERA_INDEX, width=FRAME_WIDTH, height=FRAME_HEIGHT, fps=TARGET_FPS):
-        self.src = src
-        self.width = width
-        self.height = height
-        self.fps = fps
-        self.cap = None
-        self.frame = None
-        self.is_running = False
-        self.lock = threading.Lock()
-        self.init_camera()
-
-    def init_camera(self):
-        import cv2
-        self.cap = cv2.VideoCapture(self.src, cv2.CAP_V4L2)
-        if not self.cap.isOpened():
-            self.cap = cv2.VideoCapture(self.src)
-
-        if not self.cap.isOpened():
-            for alt in [1, 2, 0]:
-                test = cv2.VideoCapture(alt)
-                if test.isOpened():
-                    self.cap = test
-                    break
-
-        if not self.cap.isOpened():
-            print("[Camera Warning] Webcam not detected. Running without video stream.")
-            return
-
-        try:
-            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-        except Exception:
-            pass
-
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        self.cap.set(cv2.CAP_PROP_FPS, self.fps)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-        ret, initial = self.cap.read()
-        if ret:
-            self.frame = initial
-
-        self.is_running = True
-        self.thread = threading.Thread(target=self._capture_loop, daemon=True)
-        self.thread.start()
-
-    def _capture_loop(self):
-        import cv2
-        while self.is_running:
-            if not self.cap or not self.cap.isOpened():
-                time.sleep(0.05)
-                continue
-            ret = self.cap.grab()
-            if ret:
-                ret_f, frame = self.cap.retrieve()
-                if ret_f:
-                    with self.lock:
-                        self.frame = frame
-            else:
-                time.sleep(0.005)
-
-    def get_frame(self):
-        with self.lock:
-            return self.frame.copy() if self.frame is not None else None
-
-    def release(self):
-        self.is_running = False
-        if self.cap:
-            self.cap.release()
-
-camera = None
-
-# --- Motor Watchdog & State ---
-current_linear = 0.0
-current_angular = 0.0
-last_cmd_timestamp = 0.0
+# ---------------------------------------------------------------------------
+# Motors
+# ---------------------------------------------------------------------------
 motor_lock = threading.Lock()
+cur_lin = 0.0
+cur_ang = 0.0
+last_cmd_time = 0.0      # monotonic
+last_seq = None
+cmd_count = 0
+_warned = 0.0
+
 
 def dispatch_hardware_velocity(linear, angular):
-    """Sends velocity commands to physical TurtleBot motors with strict hardware safety clamping"""
-    global ros_cmd_pub, ROS_MODE, TwistClass, SERIAL_ENABLED, serial_conn
-    
-    # Enforce physical hardware velocity limits (TurtleBot3 Burger specification)
-    linear = max(-0.22, min(0.22, float(linear)))
-    angular = max(-1.40, min(1.40, float(angular)))
-    
-    # 1. Publish to ROS 1 or ROS 2 /cmd_vel
-    if ROS_MODE in ['ROS1', 'ROS2'] and ros_cmd_pub is not None and TwistClass is not None:
+    global _warned
+    if NO_MOTORS:
+        return
+    linear = max(-MAX_LINEAR, min(MAX_LINEAR, float(linear)))
+    angular = max(-MAX_ANGULAR, min(MAX_ANGULAR, float(angular)))
+
+    if ros_cmd_pub is not None and TwistClass is not None:
         try:
             t = TwistClass()
-            t.linear.x = float(linear)
-            t.angular.z = float(angular)
+            t.linear.x = linear
+            t.angular.z = angular
             ros_cmd_pub.publish(t)
-
-            sub_count = 1
-            if ROS_MODE == 'ROS2' and hasattr(ros_cmd_pub, 'get_subscription_count'):
-                try:
-                    sub_count = ros_cmd_pub.get_subscription_count()
-                except Exception:
-                    sub_count = 1
-
-            if sub_count == 0 and (abs(linear) > 0.01 or abs(angular) > 0.01):
-                now = time.time()
-                if not hasattr(dispatch_hardware_velocity, "_warn_t") or (now - dispatch_hardware_velocity._warn_t > 4.0):
-                    dispatch_hardware_velocity._warn_t = now
-                    print("[WARNING] /cmd_vel has 0 active subscribers! OpenCR hardware driver is NOT running.")
-                    print("  -> Start OpenCR with: ros2 launch turtlebot3_bringup robot.launch.py")
-            elif abs(linear) > 0.001 or abs(angular) > 0.001:
-                print(f"[Actuation -> {ROS_MODE}] v_x={linear:+.2f} m/s, w_z={angular:+.2f} rad/s")
+            if ROS_MODE == 'ROS2' and (abs(linear) > 0.01 or abs(angular) > 0.01):
+                subs = ros_cmd_pub.get_subscription_count()
+                if subs == 0 and time.monotonic() - _warned > 4.0:
+                    _warned = time.monotonic()
+                    print("[Pi] WARNING: /cmd_vel has no subscriber. OpenCR bringup is not running.")
             return
         except Exception as e:
-            print(f"[ROS Publish Error] {e}")
+            print(f"[Pi] publish error: {e}")
 
-    # 2. Direct OpenCR Serial Fallback
     if SERIAL_ENABLED and serial_conn is not None:
-        packet = f"V:{linear:.2f},W:{angular:.2f}\n"
         try:
-            serial_conn.write(packet.encode("utf-8"))
-            return
+            serial_conn.write(f"V:{linear:.2f},W:{angular:.2f}\n".encode("ascii"))
         except Exception as e:
-            print(f"[Serial Write Error] {e}")
+            print(f"[Pi] serial error: {e}")
 
-def motor_safety_watchdog():
-    """Safety watchdog: shuts down physical motors if laptop stops transmitting for >0.6s"""
-    global current_linear, current_angular, last_cmd_timestamp
-    while True:
-        with motor_lock:
-            if last_cmd_timestamp > 0 and (time.time() - last_cmd_timestamp > 0.6):
-                if current_linear != 0.0 or current_angular != 0.0:
-                    current_linear = 0.0
-                    current_angular = 0.0
-                    dispatch_hardware_velocity(0.0, 0.0)
-                    print("[Safety Watchdog] Laptop heartbeat timed out -> Motors stopped.")
-        time.sleep(0.1)
 
-watchdog_thread = threading.Thread(target=motor_safety_watchdog, daemon=True)
-watchdog_thread.start()
-
-# --- Fast UDP Command Listener ---
-def udp_command_listener():
-    """Receives UDP velocity commands from laptop for zero-latency control"""
-    global current_linear, current_angular, last_cmd_timestamp
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.bind(('0.0.0.0', UDP_PORT))
-        print(f"[TurtleBot Bridge] Fast UDP listener listening on port {UDP_PORT}")
-        while True:
-            data, _ = sock.recvfrom(256)
-            if not data:
-                continue
-            text = data.decode("utf-8", errors="ignore").strip()
-            lin, ang = 0.0, 0.0
-            if text.startswith("{"):
-                try:
-                    j = json.loads(text)
-                    lin = float(j.get("linear", 0.0))
-                    ang = float(j.get("angular", 0.0))
-                except Exception:
-                    continue
-            elif "V:" in text and "W:" in text:
-                try:
-                    parts = text.split(",")
-                    for p in parts:
-                        if p.startswith("V:"):
-                            lin = float(p.split(":")[1])
-                        elif p.startswith("W:"):
-                            ang = float(p.split(":")[1])
-                except Exception:
-                    continue
-            else:
-                continue
-
-            with motor_lock:
-                current_linear = lin
-                current_angular = ang
-                last_cmd_timestamp = time.time()
-
-            dispatch_hardware_velocity(lin, ang)
-    except Exception as e:
-        print(f"[UDP Listener Warning] Could not start UDP socket: {e}")
-
-udp_thread = threading.Thread(target=udp_command_listener, daemon=True)
-udp_thread.start()
-
-def generate_mjpeg():
-    import cv2
-    encode_params = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
-    last_sent = 0.0
-    frame_interval = 1.0 / TARGET_FPS
-
-    while True:
-        if camera is None:
-            time.sleep(0.02)
-            continue
-
-        now = time.time()
-        if now - last_sent < frame_interval:
-            time.sleep(0.002)
-            continue
-
-        frame = camera.get_frame()
-        if frame is None:
-            time.sleep(0.005)
-            continue
-
-        last_sent = now
-        success, buf = cv2.imencode('.jpg', frame, encode_params)
-        if not success:
-            continue
-
-        yield (
-            b'--frame\r\n'
-            b'Content-Type: image/jpeg\r\n\r\n'
-            + buf.tobytes()
-            + b'\r\n'
-        )
-
-# --- Routes ---
-
-@app.route('/video_feed')
-def video_feed():
-    return Response(generate_mjpeg(), mimetype='multipart/x-mixed-replace; boundary=frame')
-
-@app.route('/cmd_vel', methods=['POST'])
-def cmd_vel():
-    """Receives velocity commands from the laptop AI node"""
-    global current_linear, current_angular, last_cmd_timestamp
-    data = request.get_json(silent=True) or {}
-    lin = float(data.get("linear", 0.0))
-    ang = float(data.get("angular", 0.0))
-
+def apply_command(lin, ang):
+    global cur_lin, cur_ang, last_cmd_time
     with motor_lock:
-        current_linear = lin
-        current_angular = ang
-        last_cmd_timestamp = time.time()
-
+        cur_lin, cur_ang = lin, ang
+        last_cmd_time = time.monotonic()
     dispatch_hardware_velocity(lin, ang)
-    return jsonify({"status": "received", "linear": lin, "angular": ang})
 
-def check_and_launch_opencr():
-    """Checks if turtlebot3_node is active. If not, auto-launches robot.launch.py in background."""
-    import subprocess
-    try:
-        out = subprocess.check_output(["pgrep", "-f", "turtlebot3_node"]).decode().strip()
-        if out:
-            print("[Auto-Bringup] OpenCR hardware driver is already running.")
-            return True
-    except Exception:
-        pass
 
-    print("[Auto-Bringup] OpenCR hardware driver is NOT running. Auto-launching in background...")
-    launch_script = """
-    export ROS_DOMAIN_ID=30
-    export TURTLEBOT3_MODEL=burger
-    export LDS_MODEL=LDS-01
-    export ROS_LOCALHOST_ONLY=0
-    if [ -f /opt/ros/humble/setup.bash ]; then source /opt/ros/humble/setup.bash; fi
-    if [ -f ~/turtlebot3_ws/install/setup.bash ]; then source ~/turtlebot3_ws/install/setup.bash; fi
-    ros2 launch turtlebot3_bringup robot.launch.py
-    """
-    try:
-        subprocess.Popen(["bash", "-c", launch_script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(3.5)
-        subprocess.Popen(["bash", "-c", "source /opt/ros/humble/setup.bash && export ROS_DOMAIN_ID=30 && ros2 service call /motor_power std_srvs/srv/SetBool \"{data: true}\""],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        print("[Auto-Bringup] Hardware launch initiated and motor power enabled.")
-        return True
-    except Exception as e:
-        print(f"[Auto-Bringup Error] {e}")
-        return False
+def watchdog_loop():
+    global cur_lin, cur_ang
+    while True:
+        time.sleep(0.05)
+        with motor_lock:
+            stale = last_cmd_time > 0 and (time.monotonic() - last_cmd_time) > CMD_TIMEOUT
+            moving = cur_lin != 0.0 or cur_ang != 0.0
+            if stale and moving:
+                cur_lin = cur_ang = 0.0
+            else:
+                stale = False
+        if stale:
+            dispatch_hardware_velocity(0.0, 0.0)
+            print("[Pi] Command heartbeat lost -> motors stopped.")
 
-@app.route('/launch_hardware', methods=['GET', 'POST'])
-def launch_hardware():
-    """Endpoint to trigger robot.launch.py without needing an SSH terminal"""
-    t = threading.Thread(target=check_and_launch_opencr, daemon=True)
-    t.start()
-    return jsonify({"status": "initiating_hardware_launch", "message": "Launching OpenCR driver & enabling motor torque"})
 
-@app.route('/motor_power', methods=['GET', 'POST'])
-def motor_power():
-    """Endpoint to enable Dynamixel motor power/torque"""
-    import subprocess
-    try:
-        subprocess.Popen(["bash", "-c", "source /opt/ros/humble/setup.bash && export ROS_DOMAIN_ID=30 && ros2 service call /motor_power std_srvs/srv/SetBool \"{data: true}\""],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return jsonify({"status": "motor_power_requested"})
-    except Exception as e:
-        return jsonify({"status": "error", "error": str(e)})
+# ---------------------------------------------------------------------------
+# Network
+# ---------------------------------------------------------------------------
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
+peer = None          # (ip, port) of the laptop video socket
+peer_time = 0.0      # monotonic
+peer_lock = threading.Lock()
 
-@app.route('/test_motors', methods=['GET', 'POST'])
-def test_motors():
-    """Hardware Motor Test: Ensures motor power is enabled, then spins wheels for 1.5s"""
-    def _run_test():
-        import subprocess
-        # 1. Attempt to enable motor power service
+
+def udp_rx_loop():
+    global peer, peer_time, last_seq, cmd_count
+    while True:
         try:
-            subprocess.run(["bash", "-c", "source /opt/ros/humble/setup.bash && export ROS_DOMAIN_ID=30 && ros2 service call /motor_power std_srvs/srv/SetBool \"{data: true}\""],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
-        except Exception:
-            pass
+            data, addr = sock.recvfrom(512)
+        except OSError:
+            return
+        if data.startswith(b"HELLO"):
+            with peer_lock:
+                if peer != addr:
+                    print(f"[Pi] Video peer: {addr[0]}:{addr[1]}")
+                peer = addr
+                peer_time = time.monotonic()
+            continue
+        parsed = tb_proto.parse_command(data)
+        if parsed is None:
+            continue
+        lin, ang, seq = parsed
+        # Out-of-order packets are dropped, but after half a second of silence the sender has restarted
+        # (its counter starts over), so its first packet must be accepted.
+        if not tb_proto.seq_is_newer(seq, last_seq) and (time.monotonic() - last_cmd_time) < 0.5:
+            continue
+        if seq is not None:
+            last_seq = seq
+        cmd_count += 1
+        apply_command(lin, ang)
 
-        print("[Motor Test] Starting 1.5-second hardware spin test...")
-        # 2. Command angular rotation in bursts to ensure OpenCR picks it up
-        for _ in range(15):
-            dispatch_hardware_velocity(0.0, 0.6)  # Turn in place at 0.6 rad/s
-            time.sleep(0.1)
-        dispatch_hardware_velocity(0.0, 0.0)  # Stop
-        print("[Motor Test] Test completed successfully.")
 
-    t = threading.Thread(target=_run_test, daemon=True)
-    t.start()
-    return jsonify({
-        "status": "testing",
-        "message": "Motors commanded to spin for 1.5s at angular 0.6 rad/s.",
-        "ros_connected": ROS_ENABLED,
-        "serial_connected": SERIAL_ENABLED
-    })
+def current_peer():
+    with peer_lock:
+        if peer is not None and time.monotonic() - peer_time < PEER_TIMEOUT:
+            return peer
+    return None
 
-@app.route('/health')
-def health():
-    sub_count = 0
-    if ROS_MODE == 'ROS2' and ros_cmd_pub is not None and hasattr(ros_cmd_pub, 'get_subscription_count'):
+
+# ---------------------------------------------------------------------------
+# Camera
+# ---------------------------------------------------------------------------
+class Camera:
+    """Keeps only the newest frame. Encoding happens in the sender, not here."""
+
+    def __init__(self):
+        self.cap = None
+        self.raw = False
+        self.latest = None      # ndarray, or bytes when raw
+        self.frame_no = 0
+        self.cond = threading.Condition()
+        self.running = True
+        self.capture_fps = 0.0
+        self._open()
+        if self.cap is not None:
+            threading.Thread(target=self._loop, daemon=True).start()
+
+    def _open(self):
+        import cv2
+        cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_V4L2)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(CAMERA_INDEX)
+        if not cap.isOpened():
+            for alt in (1, 2):
+                cap = cv2.VideoCapture(alt)
+                if cap.isOpened():
+                    break
+        if not cap.isOpened():
+            print("[Pi] Camera not detected.")
+            return
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+        cap.set(cv2.CAP_PROP_FPS, TARGET_FPS)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        if RAW_MJPEG:
+            cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
+            ok, frame = cap.read()
+            if ok and frame is not None and frame.size > 4 and bytes(frame.reshape(-1)[:2]) == b"\xff\xd8":
+                self.raw = True
+                print("[Pi] Raw MJPEG passthrough: the Pi does not decode or re-encode.")
+            else:
+                print("[Pi] Camera gave no raw MJPEG; falling back to re-encode.")
+                cap.release()
+                cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_V4L2)
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.cap = cap
+        print(f"[Pi] Camera open ({int(cap.get(3))}x{int(cap.get(4))}).")
+
+    def _loop(self):
+        n, t0 = 0, time.monotonic()
+        while self.running:
+            if not self.cap.grab():
+                time.sleep(0.004)
+                continue
+            ok, frame = self.cap.retrieve()
+            if not ok or frame is None:
+                continue
+            item = bytes(frame.reshape(-1)) if self.raw else frame
+            with self.cond:
+                self.latest = item
+                self.frame_no += 1
+                self.cond.notify_all()
+            n += 1
+            now = time.monotonic()
+            if now - t0 >= 1.0:
+                self.capture_fps = n / (now - t0)
+                n, t0 = 0, now
+
+    def wait_new(self, last_no, timeout):
+        with self.cond:
+            if self.frame_no == last_no:
+                self.cond.wait(timeout)
+            return self.frame_no, self.latest
+
+
+def no_camera_jpeg():
+    import cv2
+    import numpy as np
+    img = np.zeros((FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
+    cv2.rectangle(img, (40, 160), (600, 320), (30, 40, 55), -1)
+    cv2.putText(img, "TURTLEBOT CAMERA NOT DETECTED", (70, 220),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 180, 255), 2, cv2.LINE_AA)
+    cv2.putText(img, "Plug the camera into the Pi.", (150, 270),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 210, 220), 1, cv2.LINE_AA)
+    return cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 60])[1].tobytes()
+
+
+def sender_loop(camera):
+    import cv2
+    params = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
+    placeholder = None
+    last_no = -1
+    fid = 0
+    sent = 0
+    t0 = time.monotonic()
+    send_fps = 0.0
+    last_status = 0.0
+    min_gap = 1.0 / TARGET_FPS
+    last_send = 0.0
+    last_scan_sent = 0.0
+
+    while True:
+        if camera.cap is None:
+            time.sleep(0.2)
+            if placeholder is None:
+                placeholder = no_camera_jpeg()
+            frame_no, item = last_no + 1, placeholder
+        else:
+            frame_no, item = camera.wait_new(last_no, 0.25)
+
+        dest = current_peer()
+        now = time.monotonic()
+
+        if dest is not None and now - last_status >= 0.5:
+            last_status = now
+            subs = 0
+            if ROS_MODE == 'ROS2' and ros_cmd_pub is not None:
+                try:
+                    subs = ros_cmd_pub.get_subscription_count()
+                except Exception:
+                    pass
+            with motor_lock:
+                cmd_age = (now - last_cmd_time) if last_cmd_time else None
+                lin, ang = cur_lin, cur_ang
+            status = {
+                "ros": ROS_MODE, "subs": subs, "serial": SERIAL_ENABLED,
+                "motors": not NO_MOTORS, "camera": camera.cap is not None,
+                "cam_fps": round(camera.capture_fps, 1), "send_fps": round(send_fps, 1),
+                "raw": camera.raw, "cmd_age": None if cmd_age is None else round(cmd_age, 2),
+                "cmds": cmd_count, "lin": lin, "ang": ang,
+                "scan_hz": round(scan_hz, 1) if scan_time and now - scan_time < 1.0 else 0.0,
+            }
+            try:
+                sock.sendto(tb_proto.pack_status(status, time.time()), dest)
+            except OSError:
+                pass
+
+        if dest is not None:
+            with scan_lock:
+                fresh = scan_bins is not None and scan_time > last_scan_sent
+                bins, pose, stamp = scan_bins, odom_pose, scan_time
+            if fresh:
+                last_scan_sent = stamp
+                try:
+                    sock.sendto(tb_proto.pack_scan(bins, pose, time.time()), dest)
+                except OSError:
+                    pass
+
+        if frame_no == last_no or item is None or dest is None:
+            continue
+        if now - last_send < min_gap:
+            time.sleep(min_gap - (now - last_send))
+            frame_no, item = (frame_no, item) if camera.cap is None else camera.wait_new(last_no, 0.0)
+        last_no = frame_no
+        if isinstance(item, bytes):
+            jpeg = item
+        else:
+            ok, buf = cv2.imencode(".jpg", item, params)
+            if not ok:
+                continue
+            jpeg = buf.tobytes()
+
+        fid += 1
         try:
-            sub_count = ros_cmd_pub.get_subscription_count()
-        except Exception:
-            pass
-    return jsonify({
-        "status": "ok",
-        "ros_connected": ROS_ENABLED,
-        "ros_mode": ROS_MODE,
-        "cmd_vel_subscribers": sub_count,
-        "opencr_active": (sub_count > 0),
-        "serial_connected": SERIAL_ENABLED,
-        "serial_port": SERIAL_PORT if SERIAL_ENABLED else None,
-        "current_cmd": {"linear": current_linear, "angular": current_angular}
-    })
+            for i, pkt in enumerate(tb_proto.pack_frame(jpeg, fid, time.time())):
+                sock.sendto(pkt, dest)
+                if i % 6 == 5:
+                    time.sleep(0.0007)  # pace the burst so Wi-Fi does not drop the tail of a frame
+        except OSError:
+            continue
+        last_send = now
+        sent += 1
+        if now - t0 >= 1.0:
+            send_fps = sent / (now - t0)
+            sent, t0 = 0, now
 
-@app.route('/')
-def index():
-    return f"""
-    <h2>Raspberry Pi TurtleBot Companion Node Active</h2>
-    <p>Camera Stream: <a href="/video_feed">/video_feed</a></p>
-    <p>ROS Mode: <b>{ROS_MODE if ROS_ENABLED else 'Disabled / Standby'}</b></p>
-    <p>OpenCR Serial: <b>{'Connected on ' + SERIAL_PORT if SERIAL_ENABLED else 'Standby'}</b></p>
-    <p>Motor Test: <a href="/test_motors">Click here to test motor spin</a></p>
-    """
 
 def run_standalone_test():
-    """Standalone CLI motor test: python3 pi_turtlebot_node.py --test"""
-    print("\n" + "=" * 50)
-    print("  TURTLEBOT HARDWARE MOTOR TEST")
-    print("=" * 50)
-    print(f"ROS Mode      : {ROS_MODE}")
-    print(f"OpenCR Serial : {SERIAL_ENABLED} ({SERIAL_PORT})")
-    print("Commanding forward rotation for 1.5 seconds...")
-    dispatch_hardware_velocity(0.08, 0.0)
-    time.sleep(1.5)
-    print("Commanding stop...")
+    print(f"[Pi] Motor test. ROS={ROS_MODE} serial={SERIAL_ENABLED} no_motors={NO_MOTORS}")
+    for _ in range(15):
+        dispatch_hardware_velocity(0.0, 0.6)
+        time.sleep(0.1)
     dispatch_hardware_velocity(0.0, 0.0)
-    print("Test finished! If wheels moved, hardware is working 100%.\n")
+    print("[Pi] Test finished.")
 
-if __name__ == '__main__':
+
+def main():
     if "--test" in sys.argv:
         run_standalone_test()
-        sys.exit(0)
-
-    print("=" * 60)
-    print("  TURTLEBOT PI COMPANION NODE (PHASE 2 MOTOR CONTROL)")
-    print(f"  ROS Connected    : {ROS_ENABLED} ({ROS_MODE})")
-    print(f"  OpenCR Serial    : {SERIAL_ENABLED} ({SERIAL_PORT if SERIAL_ENABLED else 'None'})")
-    print(f"  HTTP Port        : {PORT}")
-    print(f"  UDP Port         : {UDP_PORT}")
-    print("=" * 60)
+        return
     try:
-        camera = ThreadedCamera()
-        app.run(host='0.0.0.0', port=PORT, threaded=True, debug=False, use_reloader=False)
+        sock.bind(("0.0.0.0", tb_proto.CMD_PORT))
+    except OSError as e:
+        print(f"[Pi] Cannot bind UDP {tb_proto.CMD_PORT}: {e}")
+        sys.exit(1)
+
+    print("=" * 56)
+    print("  TURTLEBOT PI NODE  (UDP only, nothing hosted)")
+    print(f"  ROS: {ROS_MODE}   serial: {SERIAL_ENABLED}   motors: {not NO_MOTORS}")
+    print(f"  UDP in  : {tb_proto.CMD_PORT} (commands + HELLO)")
+    print("  UDP out : video + status to whoever sends HELLO")
+    print("=" * 56)
+
+    threading.Thread(target=watchdog_loop, daemon=True).start()
+    threading.Thread(target=udp_rx_loop, daemon=True).start()
+    camera = Camera()
+    try:
+        sender_loop(camera)
+    except KeyboardInterrupt:
+        pass
     finally:
-        if camera:
-            camera.release()
+        camera.running = False
         dispatch_hardware_velocity(0.0, 0.0)
+
+
+if __name__ == '__main__':
+    main()

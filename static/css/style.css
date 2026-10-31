@@ -203,17 +203,68 @@ body {
     color: var(--neon-green);
 }
 
-/* Dual Video Grid */
+/* Single live view, kept narrow enough that the picture stays on screen */
 .video-grid {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: minmax(0, 820px) minmax(300px, 440px);
+    justify-content: center;
+    align-items: start;
     gap: 20px;
 }
 
-@media (max-width: 980px) {
+@media (max-width: 1280px) {
     .video-grid {
         grid-template-columns: 1fr;
     }
+}
+
+/* Re-ID readout */
+.reid-detail { font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-secondary); margin: 10px 0 6px; }
+.reid-bar { position: relative; height: 8px; background: rgba(0,0,0,0.35); border-radius: 4px; margin-bottom: 14px; }
+.reid-fill { height: 100%; width: 0; border-radius: 4px; background: var(--neon-green); transition: width 0.15s; }
+.reid-fill.warn { background: var(--neon-amber); }
+.reid-fill.bad { background: var(--neon-crimson); }
+.reid-mark { position: absolute; top: -3px; width: 2px; height: 14px; background: #fff; opacity: 0.8; left: 0; }
+
+/* LiDAR card */
+.side-col { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
+.lidar-card img { width: 100%; aspect-ratio: 1; display: block; background: #14181e; object-fit: contain; }
+.sector-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.sector {
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    padding: 6px 8px;
+    text-align: center;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+.sector span { font-size: 0.64rem; letter-spacing: 0.1em; color: var(--text-muted); }
+.sector b { font-family: var(--font-mono); font-size: 1.05rem; color: var(--neon-green); }
+.sector b.warn { color: var(--neon-amber); }
+.sector b.bad { color: var(--neon-crimson); }
+
+/* Link health */
+.lh-body { padding: 14px 16px 18px; display: flex; flex-direction: column; gap: 12px; }
+.lh-body canvas { width: 100%; height: 46px; background: rgba(0, 0, 0, 0.3); border-radius: 6px; }
+.lh-grid {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 7px 12px;
+    font-size: 0.82rem;
+    color: var(--text-secondary);
+}
+.lh-val { font-family: var(--font-mono); font-weight: 600; color: var(--text-primary); text-align: right; }
+.lh-val.ok { color: var(--neon-green); }
+.lh-val.warn { color: var(--neon-amber); }
+.lh-val.bad { color: var(--neon-crimson); }
+.lh-sep {
+    font-size: 0.68rem;
+    letter-spacing: 0.12em;
+    color: var(--text-muted);
+    border-top: 1px solid var(--border-subtle);
+    padding-top: 10px;
 }
 
 .video-card {
@@ -331,7 +382,8 @@ body {
     justify-content: center;
 }
 
-.video-wrapper img {
+.video-wrapper img,
+.video-wrapper canvas {
     width: 100%;
     height: 100%;
     object-fit: contain;

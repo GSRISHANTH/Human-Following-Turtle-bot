@@ -1,10 +1,7 @@
 """
 Robot Controller & Command Dispatcher (Phase 2):
-Dispatches velocity commands (cmd_vel: linear_x, angular_z) to TurtleBot.
-Supports:
-1. HTTP REST (POST http://<pi_ip>:5000/cmd_vel) - Universal JSON endpoint
-2. UDP Socket (Direct low-latency packets on port 8888)
-3. Non-blocking async queue to guarantee jitter-free 20Hz control loop
+Dispatches velocity commands (cmd_vel: linear_x, angular_z) to TurtleBot as UDP
+datagrams to the Pi on port 8888, at a fixed rate that doubles as the Pi's heartbeat.
 
 Features:
 - Acceleration/Slew-rate limiting (prevents jerky robot motion and wheel slip)
@@ -14,14 +11,10 @@ Features:
 """
 
 import time
-import json
-import queue
 import socket
 import threading
-import urllib.request
-import urllib.error
-from urllib.parse import urlparse
 from config import Config
+from video_streamer import tb_proto
 
 class RobotController:
     def __init__(self):
@@ -29,7 +22,7 @@ class RobotController:
         
         # Operational mode: 'AUTO', 'MANUAL', 'STOP', 'SEARCH_ROTATING'
         self.mode = "AUTO"
-        self.protocol = Config.COMMAND_MODE  # 'http', 'rosbridge', 'udp', 'mock'
+        self.protocol = Config.COMMAND_MODE  # 'udp' or 'mock'
         
         # Current and Target Velocities
         self.target_linear = 0.0
@@ -42,28 +35,29 @@ class RobotController:
         self.max_angular = Config.MAX_ANGULAR_VEL  # 1.5 rad/s
         
         # Acceleration limits (m/s^2 and rad/s^2) - tuned for snappy, immediate response
-        self.max_accel_linear = 0.90
-        self.max_accel_angular = 3.60
+        self.max_accel_linear = Config.MAX_ACCEL_LINEAR
+        self.max_accel_angular = Config.MAX_ACCEL_ANGULAR
         
         # Safety & Watchdog
         self.last_command_time = time.time()
         self.watchdog_timeout = 0.6  # seconds
         self.emergency_stop = False
+        self.front_clear = None       # LiDAR nearest return straight ahead (m), person included
+        self.front_clear_time = 0.0
         
         # Hardware connection endpoints
-        self.http_url = f"http://{Config.PI_IP}:{Config.PI_STREAM_PORT}/cmd_vel"
         self.udp_ip = Config.PI_IP
         self.udp_port = Config.UDP_PORT
         self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        
-        # Non-blocking async HTTP worker queue
-        self.http_queue = queue.Queue(maxsize=1)
+        try:
+            self.udp_sock.ioctl(socket.SIO_UDP_CONNRESET, False)
+        except (AttributeError, OSError, ValueError):
+            pass
+        # Starts at the wall-clock second so a restarted laptop is never older than the Pi's last seq.
+        self.seq = int(time.time() * 100) & 0xFFFFFFFF
         self.is_running = True
-        
-        self.http_thread = threading.Thread(target=self._http_worker, daemon=True)
-        self.http_thread.start()
-        
-        # Background control loop (runs at ~20 Hz)
+
+        # Background control loop
         self.dispatch_thread = threading.Thread(target=self._control_loop, daemon=True)
         self.dispatch_thread.start()
 
@@ -89,15 +83,14 @@ class RobotController:
         """Releases emergency stop and returns to AUTO mode"""
         self.set_mode("AUTO")
 
-    def update_url(self, new_url):
+    def set_front_clearance(self, meters, stamp):
         with self.lock:
-            self.http_url = new_url
-            try:
-                parsed = urlparse(new_url)
-                if parsed.hostname:
-                    self.udp_ip = parsed.hostname
-            except Exception:
-                pass
+            self.front_clear = meters
+            self.front_clear_time = stamp
+
+    def update_pi_ip(self, ip):
+        with self.lock:
+            self.udp_ip = ip
 
     def update_auto_commands(self, linear_v, angular_w, can_move=True):
         """Called by CV pipeline when in AUTO_FOLLOW mode"""
@@ -146,16 +139,25 @@ class RobotController:
             }
 
     def _control_loop(self):
-        """Control loop applying acceleration ramp and dispatching at 20Hz"""
-        dt = 0.05  # 20 Hz
+        """Control loop applying acceleration ramp and dispatching at Config.COMMAND_HZ"""
+        period = 1.0 / Config.COMMAND_HZ
+        last_t = time.time()
         while self.is_running:
             start_t = time.time()
-            
+            dt = min(0.2, max(0.001, start_t - last_t))
+            last_t = start_t
+
             with self.lock:
                 # Watchdog check: zero target if timeout exceeded
                 if time.time() - self.last_command_time > self.watchdog_timeout:
                     self.target_linear = 0.0
                     self.target_angular = 0.0
+
+                # LiDAR hard stop, independent of vision: never drive into something right ahead
+                if (self.front_clear is not None and time.time() - self.front_clear_time < 0.6
+                        and self.front_clear < Config.LIDAR_HARD_STOP_M and self.target_linear > 0.0):
+                    self.target_linear = 0.0
+                    self.current_linear = min(self.current_linear, 0.0)
 
                 # Acceleration Slew Rate Limiter for Linear Velocity
                 diff_lin = self.target_linear - self.current_linear
@@ -180,58 +182,18 @@ class RobotController:
             self._transmit_to_robot(send_v, send_w)
 
             elapsed = time.time() - start_t
-            sleep_time = max(0.01, dt - elapsed)
-            time.sleep(sleep_time)
+            time.sleep(max(0.005, period - elapsed))
 
     def _transmit_to_robot(self, linear, angular):
-        """Transmits velocity commands via UDP and queues for HTTP"""
+        """One UDP datagram. Sent every cycle even when zero, so silence on the Pi means a dead link."""
         if self.protocol == "mock":
             return
-
-        payload = {"linear": linear, "angular": angular, "timestamp": time.time()}
-
-        # 1. Direct UDP transmission (ultra fast, non-blocking, ~0.05ms)
-        self._send_udp(payload)
-
-        # 2. Enqueue for HTTP transmission without blocking control loop
-        if self.protocol == "http":
-            try:
-                # If queue has older pending item, drop it to ensure latest-only transmission
-                if self.http_queue.full():
-                    try:
-                        self.http_queue.get_nowait()
-                    except queue.Empty:
-                        pass
-                self.http_queue.put_nowait(payload)
-            except Exception:
-                pass
-
-    def _http_worker(self):
-        """Dedicated background worker for HTTP POST requests"""
-        while self.is_running:
-            try:
-                payload = self.http_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-
-            try:
-                req = urllib.request.Request(
-                    self.http_url,
-                    data=json.dumps(payload).encode("utf-8"),
-                    headers={"Content-Type": "application/json"}
-                )
-                urllib.request.urlopen(req, timeout=0.25)
-            except Exception:
-                pass
-            finally:
-                self.http_queue.task_done()
-
-    def _send_udp(self, payload):
-        """UDP datagram to Raspberry Pi port 8888"""
+        with self.lock:
+            self.seq = (self.seq + 1) & 0xFFFFFFFF
+            seq, ip = self.seq, self.udp_ip
         try:
-            msg = f"V:{payload['linear']:.2f},W:{payload['angular']:.2f}\n".encode("utf-8")
-            self.udp_sock.sendto(msg, (self.udp_ip, self.udp_port))
-        except Exception:
+            self.udp_sock.sendto(tb_proto.encode_command(linear, angular, seq), (ip, self.udp_port))
+        except OSError:
             pass
 
     def stop(self):

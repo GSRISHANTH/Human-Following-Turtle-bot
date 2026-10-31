@@ -20,11 +20,15 @@ Validates the 16 mandatory acceptance scenarios defined in the Master Implementa
 """
 
 import os
+import sys
 import time
 import math
 import unittest
+from pathlib import Path
 import numpy as np
 import cv2
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "laptop"))
 
 from config import Config
 from appearance_model import AppearanceModel

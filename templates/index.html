@@ -7,9 +7,15 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="stylesheet" href="/static/css/style.css?v=5">
 </head>
 <body>
+    {% if hil %}
+    <div style="background:#123528;color:#c8f5d8;padding:10px 18px;font-family:Outfit,sans-serif;font-size:14px;border-bottom:1px solid #1f6b48;">
+        HIL bench — leave the TurtleBot on the charger. This laptop camera is the video source, and velocity commands drive a simulated Burger (no OpenCR motors).
+        Pose map: <a href="http://127.0.0.1:5000/" style="color:#7dffe0;">http://127.0.0.1:5000/</a>
+    </div>
+    {% endif %}
     <div class="app-container">
         <!-- Top Navigation Header -->
         <header class="app-header">
@@ -30,11 +36,15 @@
             <div class="header-status">
                 <div class="status-pill" id="conn-pill">
                     <span class="status-dot" id="conn-dot"></span>
-                    <span id="conn-text">Connecting to Pi...</span>
+                    <span id="conn-text">Waiting for Pi video...</span>
                 </div>
                 <div class="metric-chip">
-                    <span class="metric-label">FPS</span>
+                    <span class="metric-label">VIDEO FPS</span>
                     <span class="metric-val highlight" id="fps-val">--</span>
+                </div>
+                <div class="metric-chip">
+                    <span class="metric-label">POSE FPS</span>
+                    <span class="metric-val highlight" id="lh-pose-head">--</span>
                 </div>
                 <div class="metric-chip">
                     <span class="metric-label">SAFETY STATUS</span>
@@ -48,37 +58,13 @@
             </div>
         </header>
 
-        <!-- Main Workspace: Dual Video Feeds -->
+        <!-- Live view: raw camera JPEGs on a canvas, pose drawn by the browser. Link health sits beside it. -->
         <main class="video-grid">
-            <!-- Feed 1: Raw Raspberry Pi Stream -->
-            <section class="video-card" id="card-raw">
-                <div class="video-card-header">
-                    <div class="stream-badge raw-badge">
-                        <span class="badge-dot"></span>
-                        <span>FEED 1: RAW RASPBERRY PI</span>
-                    </div>
-                    <span class="stream-ip" id="display-stream-ip">http://{{ pi_ip }}:5000</span>
-                </div>
-
-                <div class="video-wrapper">
-                    <img id="raw-stream-img" src="/stream/raw" alt="Raspberry Pi Raw Stream">
-                    <div class="video-overlay top-left">
-                        <span class="overlay-tag">SOURCE: PI WEBCAM</span>
-                        <span class="overlay-tag" id="raw-res">640x480</span>
-                    </div>
-                </div>
-
-                <div class="video-card-footer">
-                    <span class="footer-info">Live low-latency MJPEG feed streamed over Wi-Fi from robot</span>
-                </div>
-            </section>
-
-            <!-- Feed 2: Processed MediaPipe AI Stream -->
             <section class="video-card" id="card-processed">
                 <div class="video-card-header">
                     <div class="stream-badge ai-badge">
                         <span class="badge-dot pulse-glow"></span>
-                        <span>FEED 2: AI POSE, RE-ID &amp; MOTION</span>
+                        <span>LIVE AI VIEW</span>
                     </div>
                     <div class="target-indicator" id="target-pill">
                         <span class="indicator-dot"></span>
@@ -87,7 +73,7 @@
                 </div>
 
                 <div class="video-wrapper">
-                    <img id="processed-stream-img" src="/stream/processed" alt="AI Processed Stream">
+                    <canvas id="live-canvas" width="640" height="480"></canvas>
                     <div class="video-overlay top-left">
                         <span class="overlay-tag ai-tag">CV ENGINE ACTIVE</span>
                         <span class="overlay-tag" id="distance-badge">-- m</span>
@@ -99,9 +85,69 @@
                 </div>
 
                 <div class="video-card-footer">
-                    <span class="footer-info">Skeletal tracking, target lock reticle, disambiguation tags, and Kalman trajectory projection</span>
+                    <span class="footer-info" id="display-stream-ip">Pi camera over UDP. Newest frame only. Pose is drawn in the browser and never delays the picture.</span>
                 </div>
             </section>
+
+            <div class="side-col">
+            <aside class="video-card lidar-card" id="card-lidar">
+                <div class="video-card-header">
+                    <div class="stream-badge">
+                        <span class="badge-dot pulse-glow"></span>
+                        <span>LIDAR MAP</span>
+                    </div>
+                    <button id="btn-lidar-reset" class="btn btn-toggle" title="Forget the accumulated map">CLEAR MAP</button>
+                </div>
+                <img id="lidar-img" src="/stream/lidar" alt="2D LiDAR map">
+                <div class="lh-body">
+                    <div class="sector-row">
+                        <div class="sector"><span>LEFT</span><b id="sec-left">--</b></div>
+                        <div class="sector"><span>FRONT</span><b id="sec-front">--</b></div>
+                        <div class="sector"><span>RIGHT</span><b id="sec-right">--</b></div>
+                    </div>
+                    <div class="lh-grid">
+                        <span>Range source</span><span class="lh-val" id="fu-mode">--</span>
+                        <span>Avoidance</span><span class="lh-val" id="fu-nav">--</span>
+                        <span>Person speed (EKF)</span><span class="lh-val" id="fu-speed">--</span>
+                        <span>Person heading</span><span class="lh-val" id="fu-head">--</span>
+                        <span>Camera scale vs LiDAR</span><span class="lh-val" id="fu-scale">--</span>
+                        <span>Position on map</span><span class="lh-val" id="loc-pose">--</span>
+                        <span>Localisation</span><span class="lh-val" id="loc-q">--</span>
+                        <span>Path plan</span><span class="lh-val" id="plan-status">--</span>
+                        <span>Moving objects</span><span class="lh-val" id="loc-moving">--</span>
+                    </div>
+                </div>
+            </aside>
+
+            <aside class="video-card link-card" id="card-link">
+                <div class="video-card-header">
+                    <div class="stream-badge">
+                        <span class="badge-dot pulse-glow"></span>
+                        <span>LINK HEALTH</span>
+                    </div>
+                </div>
+                <div class="lh-body">
+                    <canvas id="fps-spark" width="260" height="46"></canvas>
+                    <div class="lh-grid">
+                        <span>Video FPS</span><span class="lh-val" id="lh-fps">--</span>
+                        <span>Pose FPS</span><span class="lh-val" id="lh-pose">--</span>
+                        <span>Frame age</span><span class="lh-val" id="lh-age">--</span>
+                        <span>Bitrate</span><span class="lh-val" id="lh-kbps">--</span>
+                        <span>Dropped frames</span><span class="lh-val" id="lh-drop">0</span>
+                    </div>
+                    <div class="lh-sep">RASPBERRY PI</div>
+                    <div class="lh-grid">
+                        <span>Node</span><span class="lh-val" id="lh-pi">--</span>
+                        <span>Camera</span><span class="lh-val" id="lh-picam">--</span>
+                        <span>ROS</span><span class="lh-val" id="lh-ros">--</span>
+                        <span>/cmd_vel subscribers</span><span class="lh-val" id="lh-subs">--</span>
+                        <span>Motors</span><span class="lh-val" id="lh-motors">--</span>
+                        <span>Last command</span><span class="lh-val" id="lh-cmdage">--</span>
+                        <span>LiDAR scans</span><span class="lh-val" id="lh-scan">--</span>
+                    </div>
+                </div>
+            </aside>
+            </div>
         </main>
 
         <!-- Comprehensive Intelligence & Motion Deck -->
@@ -130,6 +176,9 @@
                         <div class="reid-people-count" id="people-count-label">People in view: 1</div>
                     </div>
                 </div>
+
+                <div class="reid-detail" id="reid-detail">Identity: no owner enrolled.</div>
+                <div class="reid-bar"><div class="reid-fill" id="reid-fill"></div><div class="reid-mark" id="reid-mark"></div></div>
 
                 <div class="deck-action-row" style="display: flex; gap: 8px; flex-wrap: wrap;">
                     <button id="btn-enroll-owner" class="btn btn-primary" style="flex: 1 1 100%; background: linear-gradient(135deg, #00a85a, #006638); border: 1px solid #00ff88; color: #ffffff; font-weight: 700; cursor: pointer; padding: 10px 14px; border-radius: 6px; box-shadow: 0 0 10px rgba(0, 255, 120, 0.3);">
@@ -272,6 +321,6 @@
         </section>
     </div>
 
-    <script src="/static/js/dashboard.js"></script>
+    <script src="/static/js/dashboard.js?v=5"></script>
 </body>
 </html>

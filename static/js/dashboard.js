@@ -69,24 +69,30 @@ document.addEventListener("DOMContentLoaded", () => {
     const btnModeSim = document.getElementById("btn-mode-sim");
 
     let lastRenderedEventsCount = 0;
-    let isPolling = true;
     let currentMode = "AUTO";
+    let modeClickPending = false;
 
-    // --- Telemetry Poller Loop (10Hz) ---
-    async function fetchTelemetry() {
-        if (!isPolling) return;
-        try {
-            const res = await fetch("/api/telemetry");
-            if (res.ok) {
-                const data = await res.json();
-                updateUI(data);
+    // --- Telemetry: pushed by the server as each pose result lands ---
+    let latestOverlay = [];
+    let overlayAt = 0;
+    let lastPoseStamp = 0;
+
+    function connectTelemetry() {
+        const es = new EventSource("/api/stream");
+        es.onmessage = (ev) => {
+            let data;
+            try { data = JSON.parse(ev.data); } catch (e) { return; }
+            if (data.last_update !== lastPoseStamp) {
+                lastPoseStamp = data.last_update;
+                latestOverlay = data.overlay || [];
+                overlayAt = performance.now();
             }
-        } catch (err) {
-            console.warn("Telemetry fetch error:", err);
+            updateUI(data);
+        };
+        es.onerror = () => {
             connDot.className = "status-dot offline";
-            connText.textContent = "Server Offline";
-        }
-        setTimeout(fetchTelemetry, 150);
+            connText.textContent = "Dashboard server offline";
+        };
     }
 
     // --- UI Update Renderer ---
@@ -105,8 +111,10 @@ document.addEventListener("DOMContentLoaded", () => {
             }
 
             if (fpsVal) {
-                fpsVal.textContent = data.fps > 0 ? `${data.fps}` : "--";
+                fpsVal.textContent = data.fps > 0 ? `${Math.round(data.fps)}` : "--";
             }
+            updateLinkHealth(data);
+            updateFusion(data);
 
             // Robot Mode
             const rTel = data.robot_telemetry || {};
@@ -289,6 +297,105 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
+    // --- Link health: video FPS, pose FPS, age, bitrate, and what the Pi reports about itself ---
+    const setText = (id, text, cls) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.textContent = text;
+        if (cls !== undefined) el.className = "lh-val " + cls;
+    };
+    const fpsHistory = [];
+    const spark = document.getElementById("fps-spark");
+
+    function updateLinkHealth(d) {
+        const pi = d.pi || {};
+        const age = d.frame_age_ms;
+        setText("lh-fps", d.fps > 0 ? d.fps.toFixed(0) : "--", d.fps >= 20 ? "ok" : d.fps > 8 ? "warn" : "bad");
+        setText("lh-pose", d.pose_fps > 0 ? d.pose_fps.toFixed(0) : "--", d.pose_fps >= 12 ? "ok" : d.pose_fps > 5 ? "warn" : "bad");
+        const poseHead = document.getElementById("lh-pose-head");
+        if (poseHead) poseHead.textContent = d.pose_fps > 0 ? Math.round(d.pose_fps) : "--";
+        setText("lh-age", age == null ? "--" : `${age} ms`, age == null ? "" : age < 150 ? "ok" : age < 500 ? "warn" : "bad");
+        setText("lh-kbps", d.kbps ? `${(d.kbps / 1000).toFixed(1)} Mb/s` : "--");
+        setText("lh-drop", `${d.dropped || 0}`, (d.dropped || 0) > 50 ? "warn" : "");
+        const havePi = Object.keys(pi).length > 0;
+        setText("lh-pi", havePi ? "ONLINE" : (d.source_mode === "sim" ? "SIM" : "SILENT"), havePi ? "ok" : d.source_mode === "sim" ? "warn" : "bad");
+        setText("lh-ros", havePi ? (pi.ros || (pi.serial ? "SERIAL" : "NONE")) : "--", havePi && (pi.ros || pi.serial) ? "ok" : "warn");
+        setText("lh-subs", havePi ? `${pi.subs}` : "--", havePi && pi.subs > 0 ? "ok" : "warn");
+        setText("lh-motors", havePi ? (pi.motors ? "ENABLED" : "OFF (no-motors)") : "--", havePi && pi.motors ? "ok" : "warn");
+        setText("lh-cmdage", havePi && pi.cmd_age != null ? `${(pi.cmd_age * 1000).toFixed(0)} ms` : "--", havePi && pi.cmd_age != null && pi.cmd_age < 0.2 ? "ok" : "warn");
+        setText("lh-picam", havePi ? `${pi.cam_fps} fps${pi.raw ? " raw" : ""}` : "--");
+
+        fpsHistory.push(d.fps || 0);
+        if (fpsHistory.length > 90) fpsHistory.shift();
+        if (spark) {
+            const c = spark.getContext("2d");
+            const w = spark.width, h = spark.height;
+            c.clearRect(0, 0, w, h);
+            c.strokeStyle = "#00f0ff";
+            c.lineWidth = 1.5;
+            c.beginPath();
+            fpsHistory.forEach((v, i) => {
+                const x = (i / 89) * w, y = h - Math.min(v, 35) / 35 * (h - 2) - 1;
+                if (i) c.lineTo(x, y); else c.moveTo(x, y);
+            });
+            c.stroke();
+        }
+
+        // Mode buttons follow what the robot controller actually reports.
+        const m = (d.robot_telemetry || {}).mode;
+        if (m && !modeClickPending) {
+            currentMode = m;
+            btnModeAuto.classList.toggle("active", m === "AUTO");
+            btnModeManual.classList.toggle("active", m === "MANUAL");
+        }
+    }
+
+    // --- LiDAR sectors, fusion source, EKF readout ---
+    function updateFusion(d) {
+        const f = d.fusion || {};
+        const sec = f.sectors;
+        [["left", "sec-left"], ["front", "sec-front"], ["right", "sec-right"]].forEach(([k, id]) => {
+            const el = document.getElementById(id);
+            if (!el) return;
+            const v = sec ? sec[k] : null;
+            el.textContent = v == null ? "--" : `${v.toFixed(2)} m`;
+            el.className = v == null ? "" : v < 0.35 ? "bad" : v < 0.85 ? "warn" : "";
+        });
+        setText("fu-mode", f.mode || "--", f.mode === "LIDAR+CAM" ? "ok" : f.mode === "CAM" ? "warn" : "");
+        const nav = d.nav_status || "--";
+        setText("fu-nav", nav, nav.includes("STOP") ? "bad" : nav.includes("AVOID") || nav.includes("SIDE") ? "warn" : "ok");
+        const p = d.person;
+        setText("fu-speed", p ? `${p.speed.toFixed(2)} m/s` : "--");
+        setText("fu-head", p && p.speed > 0.05 ? `${(Math.atan2(p.vy, p.vx) * 180 / Math.PI).toFixed(0)}\u00b0` : "--");
+        setText("fu-scale", f.vision_scale ? `x${f.vision_scale.toFixed(2)}` : "--");
+        const loc = d.localization;
+        setText("loc-pose", loc ? `${loc.x.toFixed(2)}, ${loc.y.toFixed(2)} m  ${loc.yaw.toFixed(0)}\u00b0` : "no odometry");
+        setText("loc-q", loc ? (loc.scans < 25 ? `mapping ${loc.scans}/25` : `match ${loc.score.toFixed(2)}  drift fixed ${loc.shift.toFixed(2)} m`) : "--", loc && loc.scans >= 25 && loc.score > 0.3 ? "ok" : "warn");
+        const ps = d.plan_status || "--";
+        setText("plan-status", ps, ps === "DETOUR" ? "warn" : ps === "NO_PATH" ? "bad" : "ok");
+        setText("loc-moving", loc ? `${loc.moving}` : "--");
+
+        const r = d.reid;
+        const rd = document.getElementById("reid-detail"), rf = document.getElementById("reid-fill"), rm = document.getElementById("reid-mark");
+        if (rd && rf && rm) {
+            if (!r) {
+                rd.textContent = "Identity: no owner enrolled.";
+                rf.style.width = "0";
+            } else {
+                const label = { TRACKING: "owner tracked", REACQUIRING: `re-checking ${r.reacq}/${r.confirm}`, REACQUIRED: "owner re-acquired", REJECTED: "not the owner" }[r.state] || r.state;
+                rd.textContent = `Identity: ${label} | match ${r.best.toFixed(2)} | needs ${r.thr.toFixed(2)} | owner usually ${r.own.toFixed(2)}`;
+                rf.style.width = `${Math.min(100, r.best * 100)}%`;
+                rf.className = "reid-fill " + (r.best >= r.thr ? "" : r.state === "REJECTED" ? "bad" : "warn");
+                rm.style.left = `${Math.min(100, r.thr * 100)}%`;
+            }
+        }
+        const pi = d.pi || {};
+        setText("lh-scan", pi.scan_hz != null ? (pi.scan_hz > 0 ? `${pi.scan_hz.toFixed(0)} Hz` : "none") : "--", pi.scan_hz > 3 ? "ok" : "warn");
+    }
+
+    const btnLidarReset = document.getElementById("btn-lidar-reset");
+    if (btnLidarReset) btnLidarReset.addEventListener("click", () => fetch("/api/lidar/reset", { method: "POST" }));
+
     function getEventClass(type) {
         if (!type) return "system";
         const t = type.toLowerCase();
@@ -300,6 +407,21 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     // --- Interactive Action Handlers ---
+
+    async function setMode(mode) {
+        modeClickPending = true;
+        currentMode = mode;
+        btnModeAuto.classList.toggle("active", mode === "AUTO");
+        btnModeManual.classList.toggle("active", mode === "MANUAL");
+        try {
+            await fetch("/api/robot_mode", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ mode })
+            });
+        } catch (err) {}
+        setTimeout(() => { modeClickPending = false; }, 400);
+    }
 
     // Emergency Stop Button
     btnEstop.addEventListener("click", async () => {
@@ -314,26 +436,12 @@ document.addEventListener("DOMContentLoaded", () => {
 
     // Robot Mode: Auto Follow
     btnModeAuto.addEventListener("click", async () => {
-        currentMode = "AUTO";
-        btnModeAuto.classList.add("active");
-        btnModeManual.classList.remove("active");
-        await fetch("/api/robot_mode", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ mode: "AUTO" })
-        });
+        await setMode("AUTO");
     });
 
     // Robot Mode: Manual Teleop
     btnModeManual.addEventListener("click", async () => {
-        currentMode = "MANUAL";
-        btnModeManual.classList.add("active");
-        btnModeAuto.classList.remove("active");
-        await fetch("/api/robot_mode", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ mode: "MANUAL" })
-        });
+        await setMode("MANUAL");
     });
 
     // Enroll / Recognize Me as Owner
@@ -441,21 +549,26 @@ document.addEventListener("DOMContentLoaded", () => {
         });
     }
 
-    // D-Pad Helper Function
-    async function sendTeleop(lin, ang) {
-        // Auto-switch to MANUAL mode if user touches controls
-        if (currentMode !== "MANUAL" && (lin !== 0 || ang !== 0)) {
-            currentMode = "MANUAL";
-            btnModeManual.classList.add("active");
-            btnModeAuto.classList.remove("active");
-            try {
-                await fetch("/api/robot_mode", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ mode: "MANUAL" })
-                });
-            } catch (err) {}
-        }
+    // Teleop. The Pi stops the wheels 0.6 s after the last packet, so a held input must keep sending.
+    const SPEED = { fwd: 0.18, back: -0.12, turn: 0.70 };
+    const heldKeys = new Set();
+    let padDir = null;
+    let teleopTimer = null;
+    let lastSent = [0, 0];
+
+    function teleopVector() {
+        const dirs = new Set(heldKeys);
+        if (padDir) dirs.add(padDir);
+        let lin = 0, ang = 0;
+        if (dirs.has("up")) lin += SPEED.fwd;
+        if (dirs.has("down")) lin += SPEED.back;
+        if (dirs.has("left")) ang += SPEED.turn;
+        if (dirs.has("right")) ang -= SPEED.turn;
+        return [lin, ang];
+    }
+
+    async function pushTeleop(lin, ang) {
+        lastSent = [lin, ang];
         try {
             await fetch("/api/teleop", {
                 method: "POST",
@@ -467,47 +580,62 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
-    // Virtual D-Pad Click Events
-    dpadUp.addEventListener("mousedown", () => sendTeleop(0.18, 0.0));
-    dpadDown.addEventListener("mousedown", () => sendTeleop(-0.12, 0.0));
-    dpadLeft.addEventListener("mousedown", () => sendTeleop(0.0, 0.70));
-    dpadRight.addEventListener("mousedown", () => sendTeleop(0.0, -0.70));
-    dpadCenter.addEventListener("mousedown", () => sendTeleop(0.0, 0.0));
+    async function teleopChanged() {
+        const [lin, ang] = teleopVector();
+        const active = lin !== 0 || ang !== 0;
+        if (active && currentMode !== "MANUAL") await setMode("MANUAL");
+        if (active && !teleopTimer) {
+            teleopTimer = setInterval(() => {
+                const [l, a] = teleopVector();
+                if (l !== 0 || a !== 0) pushTeleop(l, a);
+            }, 100);
+        }
+        if (!active && teleopTimer) {
+            clearInterval(teleopTimer);
+            teleopTimer = null;
+        }
+        if (active || lastSent[0] !== 0 || lastSent[1] !== 0) pushTeleop(lin, ang);
+    }
 
-    // Stop motion on release
-    [dpadUp, dpadDown, dpadLeft, dpadRight].forEach(btn => {
-        btn.addEventListener("mouseup", () => sendTeleop(0.0, 0.0));
-        btn.addEventListener("mouseleave", () => sendTeleop(0.0, 0.0));
+    const padButtons = { up: dpadUp, down: dpadDown, left: dpadLeft, right: dpadRight };
+    Object.entries(padButtons).forEach(([dir, btn]) => {
+        btn.addEventListener("pointerdown", (e) => {
+            btn.setPointerCapture(e.pointerId);
+            padDir = dir;
+            teleopChanged();
+        });
+        const release = () => { if (padDir === dir) { padDir = null; teleopChanged(); } };
+        btn.addEventListener("pointerup", release);
+        btn.addEventListener("pointercancel", release);
+        btn.addEventListener("lostpointercapture", release);
+    });
+    dpadCenter.addEventListener("click", () => {
+        heldKeys.clear();
+        padDir = null;
+        teleopChanged();
     });
 
-    // Keyboard Teleop Controls (WASD / Arrows / Space)
+    const KEYMAP = { w: "up", arrowup: "up", s: "down", arrowdown: "down", a: "left", arrowleft: "left", d: "right", arrowright: "right" };
     window.addEventListener("keydown", (e) => {
         if (e.target.tagName === "INPUT") return;
         const key = e.key.toLowerCase();
         if (key === " " || key === "spacebar") {
             btnEstop.click();
             e.preventDefault();
-        } else if (key === "w" || key === "arrowup") {
-            sendTeleop(0.18, 0.0);
+        } else if (KEYMAP[key]) {
             e.preventDefault();
-        } else if (key === "s" || key === "arrowdown") {
-            sendTeleop(-0.12, 0.0);
-            e.preventDefault();
-        } else if (key === "a" || key === "arrowleft") {
-            sendTeleop(0.0, 0.70);
-            e.preventDefault();
-        } else if (key === "d" || key === "arrowright") {
-            sendTeleop(0.0, -0.70);
-            e.preventDefault();
+            if (!heldKeys.has(KEYMAP[key])) {
+                heldKeys.add(KEYMAP[key]);
+                teleopChanged();
+            }
         }
     });
-
     window.addEventListener("keyup", (e) => {
-        if (e.target.tagName === "INPUT") return;
         const key = e.key.toLowerCase();
-        if (["w", "s", "a", "d", "arrowup", "arrowdown", "arrowleft", "arrowright"].includes(key)) {
-            sendTeleop(0.0, 0.0);
-        }
+        if (KEYMAP[key] && heldKeys.delete(KEYMAP[key])) teleopChanged();
+    });
+    window.addEventListener("blur", () => {
+        if (heldKeys.size || padDir) { heldKeys.clear(); padDir = null; teleopChanged(); }
     });
 
     // Mode Toggle (Pi vs Sim)
@@ -531,6 +659,94 @@ document.addEventListener("DOMContentLoaded", () => {
         });
     });
 
-    // Start background telemetry polling
-    fetchTelemetry();
+    // Live view. The server forwards raw camera JPEGs; the pose is drawn here, so nothing is re-encoded.
+    // Reading the whole stream and keeping only the newest JPEG drops any backlog instead of playing it late.
+    const canvas = document.getElementById("live-canvas");
+    const ctx2d = canvas ? canvas.getContext("2d") : null;
+    let pendingBitmap = null;
+    let shownBitmap = null;
+    const LINKS = [[11, 12], [11, 23], [12, 24], [23, 24], [11, 13], [13, 15], [12, 14], [14, 16],
+                   [23, 25], [25, 27], [24, 26], [26, 28], [0, 1], [1, 2], [2, 3], [3, 7], [0, 4], [4, 5], [5, 6], [6, 8]];
+
+    function drawOverlay(w, h) {
+        if (performance.now() - overlayAt > 900) return;
+        latestOverlay.forEach((p) => {
+            const pts = {};
+            (p.pose || []).forEach((it) => { if (it.length >= 4) pts[it[0]] = it; });
+            ctx2d.lineWidth = 2;
+            ctx2d.strokeStyle = "#00f0ff";
+            LINKS.forEach(([a, b]) => {
+                const pa = pts[a], pb = pts[b];
+                if (!pa || !pb || pa[3] < 0.35 || pb[3] < 0.35) return;
+                ctx2d.beginPath();
+                ctx2d.moveTo(pa[1] * w, pa[2] * h);
+                ctx2d.lineTo(pb[1] * w, pb[2] * h);
+                ctx2d.stroke();
+            });
+            if (p.bbox && p.bbox.length === 4) {
+                ctx2d.strokeStyle = p.target ? "#50dc3c" : "#ffb703";
+                ctx2d.lineWidth = p.target ? 3 : 2;
+                ctx2d.strokeRect(p.bbox[0] * w, p.bbox[1] * h, (p.bbox[2] - p.bbox[0]) * w, (p.bbox[3] - p.bbox[1]) * h);
+            }
+        });
+    }
+
+    function paint() {
+        if (pendingBitmap) {
+            if (shownBitmap) shownBitmap.close();
+            shownBitmap = pendingBitmap;
+            pendingBitmap = null;
+        }
+        if (shownBitmap && ctx2d) {
+            if (canvas.width !== shownBitmap.width || canvas.height !== shownBitmap.height) {
+                canvas.width = shownBitmap.width;
+                canvas.height = shownBitmap.height;
+            }
+            ctx2d.drawImage(shownBitmap, 0, 0);
+            drawOverlay(canvas.width, canvas.height);
+        }
+        requestAnimationFrame(paint);
+    }
+
+    async function pumpLive() {
+        while (true) {
+            try {
+                const res = await fetch("/stream/video", { cache: "no-store" });
+                const reader = res.body.getReader();
+                let buf = new Uint8Array(0);
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    const merged = new Uint8Array(buf.length + value.length);
+                    merged.set(buf);
+                    merged.set(value, buf.length);
+                    buf = merged.length > 400000 ? merged.slice(merged.length - 250000) : merged;
+                    let end = -1;
+                    for (let i = buf.length - 2; i >= 1; i--) {
+                        if (buf[i] === 0xFF && buf[i + 1] === 0xD9) { end = i; break; }
+                    }
+                    if (end < 0) continue;
+                    let start = -1;
+                    for (let i = end - 1; i >= 0; i--) {
+                        if (buf[i] === 0xFF && buf[i + 1] === 0xD8) { start = i; break; }
+                    }
+                    if (start < 0) continue;
+                    const jpeg = buf.slice(start, end + 2);
+                    buf = buf.slice(end + 2);
+                    createImageBitmap(new Blob([jpeg], { type: "image/jpeg" })).then((bmp) => {
+                        if (pendingBitmap) pendingBitmap.close();
+                        pendingBitmap = bmp;
+                    }).catch(() => {});
+                }
+            } catch (err) {
+                await new Promise((resolve) => setTimeout(resolve, 400));
+            }
+        }
+    }
+    if (canvas) {
+        requestAnimationFrame(paint);
+        pumpLive();
+    }
+
+    connectTelemetry();
 });

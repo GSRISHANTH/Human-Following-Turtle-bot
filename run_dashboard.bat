@@ -8,5 +8,5 @@ echo.
 echo Starting Flask Server and AI Processing Engine...
 echo Open your browser at: http://localhost:8000
 echo.
-python app.py
+py -3.11 app.py
 pause

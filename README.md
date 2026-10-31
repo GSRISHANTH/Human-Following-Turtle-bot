@@ -28,14 +28,14 @@ An end-to-end intelligent human-following mobile robot using a **distributed arc
                     │   IP: 10.252.159.140  |  User: ubuntu        │
                     ├──────────────────────────────────────────────┤
                     │ • Hardware Camera Capture (640x480 @ 25 FPS) │
-                    │ • MJPEG Streaming Server (Port 5000)         │
-                    │ • UDP Motor Command Bridge (Port 8888)       │
+                    │ • UDP video sender (no server, no HTTP)      │
+                    │ • UDP command receiver (Port 8888)           │
                     │ • ROS 2 Humble (Domain ID: 30)               │
                     │ • OpenCR 1.0 Motor Driver (/dev/ttyACM0)     │
                     └──────────────────────┬───────────────────────┘
                                            │
-         Camera Video Feed (HTTP Port 5000)│ ▲ Velocity Commands (UDP Port 8888)
-         http://<PI_IP>:5000/video_feed    │ │ [vx, wz, timestamp, seq]
+         Video + status (UDP -> laptop :5000)│ ▲ HELLO + velocity (UDP -> Pi :8888)
+         JPEG datagrams, newest frame wins │ │ V:<vx>,W:<wz>,S:<seq> at 30 Hz
                                            ▼ │
                     ┌──────────────────────────────────────────────┐
                     │        Laptop Processing & Control Station    │
@@ -54,46 +54,48 @@ An end-to-end intelligent human-following mobile robot using a **distributed arc
 
 ## 2. Folder Structure: Which Folder to Go To
 
-### A. On the Laptop (AI Station)
-Open **PowerShell** or **Command Prompt** and navigate to:
-```powershell
-cd "c:\Studies\7th sem\Embedded Systems for Robotics\Project\human-following-laptop"
+```
+laptop/     Vision, gestures, safety, and the UDP command sender. Runs on the laptop.
+pi/         Camera, UDP bridge, and ROS 2 /cmd_vel. Copy this folder to the Raspberry Pi.
+hil/        Hardware-in-the-loop Burger plant. Runs on the laptop while the battery charges.
+tests/      State-machine checks and the kinematic plant check.
+templates/  Dashboard page.
+static/     Dashboard CSS and JavaScript.
 ```
 
-#### Key Laptop Files:
+### A. On the Laptop (AI Station)
+Open PowerShell in this project folder.
+
 | File | Role |
 |---|---|
-| [`app.py`](file:///c:/Studies/7th%20sem/Embedded%20Systems%20for%20Robotics/Project/human-following-laptop/app.py) | **Main entry point**. Runs Flask server, background AI processing loop, video streaming, and REST API. |
-| [`config.py`](file:///c:/Studies/7th%20sem/Embedded%20Systems%20for%20Robotics/Project/human-following-laptop/config.py) | **Central settings**. Set `PI_IP`, target distance ($1.20\text{m}$), speeds, thresholds, and ports. |
-| [`cv_pipeline.py`](file:///c:/Studies/7th%20sem/Embedded%20Systems%20for%20Robotics/Project/human-following-laptop/cv_pipeline.py) | **Master AI Engine**. Integrates pose, Re-ID, distance estimation, search rotation, and tactical HUD. |
-| [`gesture_recognizer.py`](file:///c:/Studies/7th%20sem/Embedded%20Systems%20for%20Robotics/Project/human-following-laptop/gesture_recognizer.py) | Classifies 4 skeletal gestures (`FOLLOW_ME`, `WAIT`, `RELEASE`, `STOP_HALT`). |
-| [`appearance_model.py`](file:///c:/Studies/7th%20sem/Embedded%20Systems%20for%20Robotics/Project/human-following-laptop/appearance_model.py) | Multi-template HSV histogram biometric profile, preventing target-swapping. |
-| [`obstacle_avoidance.py`](file:///c:/Studies/7th%20sem/Embedded%20Systems%20for%20Robotics/Project/human-following-laptop/obstacle_avoidance.py) | Scans left/center/right floor corridors using Sobel filtering while masking the human. |
-| [`robot_controller.py`](file:///c:/Studies/7th%20sem/Embedded%20Systems%20for%20Robotics/Project/human-following-laptop/robot_controller.py) | Packages commands with timestamps, enforces acceleration limits, and sends UDP packets. |
-| [`run_dashboard.bat`](file:///c:/Studies/7th%20sem/Embedded%20Systems%20for%20Robotics/Project/human-following-laptop/run_dashboard.bat) | One-click Windows batch script to launch [`app.py`](file:///c:/Studies/7th%20sem/Embedded%20Systems%20for%20Robotics/Project/human-following-laptop/app.py). |
-| [`test_system.py`](file:///c:/Studies/7th%20sem/Embedded%20Systems%20for%20Robotics/Project/human-following-laptop/test_system.py) | 16-scenario unit test suite verifying state transitions, gestures, and safety layers. |
+| `app.py` | Starts the laptop dashboard (`laptop/app.py`). |
+| `run_dashboard.bat` | Same launch, double-click on Windows. |
+| `run_hil.bat` | HIL bench: webcam + simulated Burger. Real motors stay off. |
+| `laptop/config.py` | `PI_IP`, follow distance (1.20 m), speed limits, ports. |
+| `laptop/cv_pipeline.py` | Pose, Re-ID, distance, search rotation, HUD. |
+| `laptop/gesture_recognizer.py` | `FOLLOW_ME`, `WAIT`, `RELEASE`, `STOP_HALT`. |
+| `laptop/appearance_model.py` | Multi-template HSV owner profile. |
+| `laptop/obstacle_avoidance.py` | Left / center / right floor corridors. |
+| `laptop/robot_controller.py` | Slew-rate limiter and UDP packets to port 8888. |
+| `laptop/video_streamer.py` | MJPEG client for the Pi (or the virtual Pi). |
+| `tests/test_system.py` | 16-scenario checks for gestures, identity, and safety. |
 
 ---
 
 ### B. On the Raspberry Pi (Robot Side)
-To access the Raspberry Pi from your laptop via SSH:
 ```bash
 ssh ubuntu@10.252.159.140
-# When prompted, enter password:
-turtlebot
+# password: turtlebot
 ```
 
-Once logged into the Pi, go to the robot workspace:
-```bash
-cd /home/ubuntu
-```
+Copy the `pi/` folder onto the Pi (for example `/home/ubuntu/pi`) and start it from that folder.
 
-#### Key Raspberry Pi Files:
 | File | Role |
 |---|---|
-| `/home/ubuntu/start_robot.sh` | **One-step bringup script**. Sources ROS 2 Humble, brings up OpenCR, enables torque, and launches companion node. |
-| `/home/ubuntu/pi_turtlebot_node.py` | Captures camera frames, hosts MJPEG on port 5000, listens for UDP motor packets on port 8888, and forwards to ROS 2 topic `/cmd_vel`. |
-| `/home/ubuntu/turtlebot3_ws/` | ROS 2 Humble TurtleBot3 workspace containing hardware packages. |
+| `pi/start_robot.sh` | Sources ROS 2 Humble, brings up OpenCR, enables torque, launches the companion node next to the script. |
+| `pi/pi_turtlebot_node.py` | UDP only: sends camera JPEGs to the laptop, receives velocity on 8888, forwards to ROS 2 `/cmd_vel`. Hosts nothing. `--no-motors`, `--raw-mjpeg`. |
+| `pi/tb_proto.py` | UDP wire format shared by the Pi, the laptop and the HIL bench. Copy it with the node. |
+| `~/turtlebot3_ws/` | ROS 2 Humble TurtleBot3 workspace on the Pi. |
 
 ---
 
@@ -115,21 +117,20 @@ Both your laptop and the Raspberry Pi must be connected to the exact same Wi-Fi 
   arp -a | Select-String "10.252.159"
   ```
 
-### Step 3: Set the IP in `config.py` on the Laptop
-Open [`config.py`](file:///c:/Studies/7th%20sem/Embedded%20Systems%20for%20Robotics/Project/human-following-laptop/config.py) on your laptop. At the top of the file, make sure `PI_IP` matches the Pi's actual IP:
-```python
-# config.py
-PI_IP = "10.252.159.140"  # <-- Update this if the Wi-Fi IP changes
+### Step 3: Set the IP in `laptop/config.py`
+`PI_IP` defaults to `10.252.159.140`. Change it there, or set it only for one run:
+
+```powershell
+$env:PI_IP = "10.252.159.140"
+python app.py
 ```
 
 ### Communication Protocols & Ports
-1. **Camera Feed (Pi -> Laptop)**:
-   - URL: `http://<PI_IP>:5000/video_feed`
-   - Format: Hardware MJPEG stream (640x480, 25 FPS).
-2. **Motor Velocity Commands (Laptop -> Pi)**:
-   - Protocol: **UDP port 8888** (JSON packet with linear $v_x$, angular $\omega_z$, timestamp, and sequence number).
-   - Backup protocol: HTTP POST to `http://<PI_IP>:5000/cmd_vel`.
-3. **Safety Watchdog**:
+1. **Handshake (Laptop -> Pi)**: the laptop sends `HELLO` every 0.5 s from its video socket (UDP 5000) to `<PI_IP>:8888`. The Pi replies to that address, so the Pi needs no laptop IP and nothing listens for HTTP on it.
+2. **Camera Feed (Pi -> Laptop)**: UDP datagrams (<= 1200 B) carrying one JPEG per frame, plus a 2 Hz status packet (ROS mode, subscribers, camera FPS). A frame missing a datagram is dropped, so loss never stalls the stream.
+3. **Motor Velocity Commands (Laptop -> Pi)**: UDP `<PI_IP>:8888`, text `V:<m/s>,W:<rad/s>,S:<seq>` at 30 Hz. Allow UDP 5000 inbound for Python in Windows Firewall if no video arrives.
+4. **Dashboard**: video is forwarded untouched to the browser, the pose is drawn on a canvas, and telemetry is pushed over Server-Sent Events. The Link Health card shows video FPS, pose FPS, frame age, bitrate, drops and the Pi's own status.
+5. **Safety Watchdog**:
    - The Raspberry Pi enforces a **0.60-second hardware watchdog**. If communication from the laptop drops for more than 600 ms, the Pi automatically zeroes motor speeds and stops the robot.
 
 ---
@@ -149,9 +150,9 @@ ssh ubuntu@10.252.159.140
 ```
 *(Enter password `turtlebot`)*
 
-Run the complete bringup script:
+Run the complete bringup script from the copied `pi` folder:
 ```bash
-bash /home/ubuntu/start_robot.sh
+bash /home/ubuntu/pi/start_robot.sh
 ```
 You will see:
 ```text
@@ -165,12 +166,11 @@ You will see:
 ---
 
 ### Step 2: Start the Laptop AI Engine & Web Dashboard
-On your laptop, open a PowerShell terminal in the project directory:
+On your laptop, open PowerShell in this project folder:
 ```powershell
-cd "c:\Studies\7th sem\Embedded Systems for Robotics\Project\human-following-laptop"
-python app.py
+py -3.11 app.py
 ```
-*(Alternatively, simply double-click [`run_dashboard.bat`](file:///c:/Studies/7th%20sem/Embedded%20Systems%20for%20Robotics/Project/human-following-laptop/run_dashboard.bat)).*
+Or double-click `run_dashboard.bat`.
 
 You will see:
 ```text
@@ -178,6 +178,24 @@ You will see:
 [CVPipeline] OpenCV HOG multi-person detector ready.
 Connecting to Raspberry Pi stream at: http://10.252.159.140:5000/video_feed
 Opening Web Dashboard on: http://localhost:8000
+```
+
+### Hardware-in-the-loop while the battery charges
+The real OpenCR motors are not required for software work. `run_hil.bat` (or `py -3.11 hil/run_hil.py`) starts a virtual Pi on this PC:
+
+- Camera: this laptop's webcam, on `http://127.0.0.1:5001/video_feed`
+- Motors: a TurtleBot3 Burger differential-drive plant (same wheel update as ROBOTIS [`turtlebot3_fake_node`](https://github.com/ROBOTIS-GIT/turtlebot3_simulations/blob/humble/turtlebot3_fake_node/src/turtlebot3_fake_node.cpp)), drawn at `http://127.0.0.1:5001/`
+- Commands: the same UDP `V:...,W:...` packets the real Pi accepts on port 8888
+
+The vision dashboard is still `http://localhost:8000`. Stand in front of the laptop camera. The robot on the floor does not move.
+
+On an Ubuntu PC with ROS 2 Humble, the official full-sensor simulator is separate and does not speak this project's UDP bridge:
+
+```bash
+export TURTLEBOT3_MODEL=burger
+ros2 launch turtlebot3_fake_node turtlebot3_fake_node.launch.py
+# sensors (LiDAR, IMU, camera) need Gazebo instead:
+ros2 launch turtlebot3_gazebo empty_world.launch.py
 ```
 
 ---
@@ -256,12 +274,13 @@ If you want to manually drive the TurtleBot:
 ## 6. Troubleshooting & Common Issues
 
 ### Issue 1: Feed 1 Shows "Disconnected" or Camera Won't Load
-- **Cause**: The laptop cannot reach the Raspberry Pi camera server on port 5000.
+- **Cause**: No UDP video is arriving from the Pi (node not running, wrong `PI_IP`, or UDP 5000 blocked on the laptop).
 - **Fix**:
   1. Test network connectivity from PowerShell:
      ```powershell
-     python -c "import urllib.request; print(urllib.request.urlopen('http://10.252.159.140:5000/video_feed', timeout=3).status)"
+     ping 10.252.159.140
      ```
+     On the Pi, `tail ~/pi_node.log` should show `Video peer: <laptop>:5000`.
   2. If it fails, check if the Pi's Wi-Fi IP changed (`hostname -I` on Pi) and update `PI_IP` in [`config.py`](file:///c:/Studies/7th%20sem/Embedded%20Systems/for%20Robotics/Project/human-following-laptop/config.py).
   3. Ensure `start_robot.sh` is running on the Pi.
 
@@ -300,3 +319,23 @@ To verify that all 16 state transitions, safety interlocks, and gesture classifi
 python test_system.py
 ```
 *(All 16 unit tests should report `OK`).*
+
+---
+
+## 7. LiDAR, EKF and PID
+
+- **LiDAR**: LDS-02 on `/scan` (`LDS_MODEL=LDS-02`, started by `ros2 launch turtlebot3_bringup robot.launch.py`). The Pi node bins it to 180 x 2 degrees plus `/odom` and sends it as one UDP datagram at about 8 Hz. It only reads; it never moves the robot.
+- **Dashboard LiDAR map**: live scan, odometry-registered occupancy grid (dead reckoning, so it drifts; press CLEAR MAP to reset), avoidance sectors, and the EKF person marker with a velocity arrow.
+- **Avoidance**: `laptop/lidar.py` finds the nearest return ahead/left/right with the followed person masked out, slows and steers around obstacles, and `RobotController` hard-stops forward motion if anything is within 0.20 m dead ahead. The camera corridors take over if the scan goes stale.
+- **Fusion**: camera pinhole bearing and range (`CAMERA_HFOV_DEG`) are cross-checked against the LiDAR range along that bearing. The LiDAR range is trusted and slowly recalibrates the camera's size-based distance (`vision_scale`).
+- **EKF** (`laptop/ekf_person.py`): state is the person's position and ground velocity in the robot frame, polar (range, bearing) measurements, robot ego-motion removed in the prediction. It supplies the velocity, the lead point the robot steers toward, and the predicted direction used to start a search.
+- **PID** (`laptop/follow_controller.py`): distance PID plus feed-forward on the person's speed, bearing PID, derivative terms from the EKF rates, anti-windup. Gains are in `Config.PID_*` and were tuned in `tests/test_follow_sim.py`.
+- **Motor command format**: `geometry_msgs/Twist` on `/cmd_vel` (Humble), `linear.x` m/s and `angular.z` rad/s, clamped to the Burger's 0.22 m/s and 1.4 rad/s on the Pi.
+- **Camera**: it must see people. Tilt it level or slightly down; distance and bearing assume a roughly horizontal optical axis.
+
+### Identity, localisation and planning
+
+- **Re-ID gate** (`CVPipeline._accept_owner`): while tracking, a candidate must score at least 75% of what the owner normally scores *and* sit within a few sigma of where the EKF has them. After any loss (left the view, occluded, program restart) the owner is only re-accepted after `REACQ_CONFIRM_FRAMES` consecutive frames above `max(REACQ_THRESHOLD, 85% of the owner's usual score)` at a consistent place. A stranger who walks in as the owner walks out is logged as `REID_REJECTED` and ignored. The Owner card shows the live match, the threshold and the confirmation progress. Appearance is a colour and proportion signature, so a stranger in near-identical clothes can still score high; raise `REACQ_THRESHOLD` if that happens.
+- **LiDAR at 1 degree**, clustered into objects. The camera's person is matched to a person-sized cluster and that cluster's centroid is the LiDAR measurement fed to the EKF. On the map, the person is green, objects that appeared in space seen free before are `MOVING`, and everything else is a static obstacle or wall.
+- **Localisation**: `LidarMap` scan-matches each scan against the map built so far (correlative matching over +/-10 cm and +/-4 degrees, damped) and keeps an odom-to-map correction, so wheel-odometry drift is corrected instead of smearing the map.
+- **Path planning** (`laptop/navigation.py`): A* on the inflated occupancy grid to a goal `TARGET_DISTANCE` short of the person. If the straight line is clear the robot drives at the person; if not, it steers at a waypoint 0.6 m along the path (`DETOUR`), and stops with `NO_PATH` if none exists. The path is drawn in magenta on the map.

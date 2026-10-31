@@ -5,28 +5,34 @@ Centralizes all perception, Re-ID, state-machine, control, safety, and network p
 
 import os
 
+# Project root stays the folder that holds the pose model, templates, and static files.
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
 class Config:
     # --- Network / Stream Settings ---
-    PI_IP = "10.252.159.140"
-    PI_STREAM_PORT = 5000
-    PI_STREAM_PATH = "/video_feed"
-    
+    # Override with PI_IP=127.0.0.1 when running the HIL bench (hil/run_hil.py).
+    # The Pi hosts nothing. The laptop listens on VIDEO_PORT (UDP) for video and
+    # sends commands plus a HELLO to PI_IP:UDP_PORT so the Pi knows where to reply.
+    PI_IP = os.environ.get("PI_IP", "10.252.159.140")
+    VIDEO_PORT = int(os.environ.get("VIDEO_PORT", "5000"))
+
     @classmethod
     def get_stream_url(cls):
-        return f"http://{cls.PI_IP}:{cls.PI_STREAM_PORT}{cls.PI_STREAM_PATH}"
+        return f"udp://{cls.PI_IP}:{cls.UDP_PORT}"
 
     # Local web dashboard
     DASHBOARD_HOST = "0.0.0.0"
     DASHBOARD_PORT = 8000
 
-    # Model asset path
-    MODEL_PATH = os.path.join(os.path.dirname(__file__), "pose_landmarker_lite.task")
+    # Model asset path (kept at the project root, not inside this package)
+    MODEL_PATH = os.path.join(PROJECT_ROOT, "pose_landmarker_lite.task")
+    OWNER_PROFILE_PATH = os.path.join(PROJECT_ROOT, "owner_profile.pkl")
 
     # --- Processing Parameters ---
     FRAME_WIDTH = 640
     FRAME_HEIGHT = 480
     TARGET_FPS = 25
-    STALE_FRAME_TIMEOUT = 0.60  # seconds before declaring video stream stale
+    STALE_FRAME_TIMEOUT = 0.80  # seconds before declaring video stream stale
 
     # --- State Machine States ---
     STATE_IDLE = "IDLE"
@@ -56,7 +62,7 @@ class Config:
 
     # --- PID & Velocity Control Limits ---
     MAX_LINEAR_VEL = 0.22         # Physical limit for TurtleBot3 Burger (m/s)
-    MIN_ROLLING_VEL = 0.12        # Minimum speed to overcome static carpet/tile wheel friction (m/s)
+    MIN_ROLLING_VEL = 0.08        # Minimum speed to overcome static carpet/tile wheel friction (m/s)
     MAX_ANGULAR_VEL = 1.20        # Maximum angular velocity (rad/s)
     STEERING_DEADZONE = 0.05      # ±5% normalized horizontal deadzone
     ANGULAR_DEADZONE = STEERING_DEADZONE  # Compatibility alias
@@ -64,6 +70,31 @@ class Config:
     # Slew-rate acceleration limits
     MAX_ACCEL_LINEAR = 0.90       # m/s^2
     MAX_ACCEL_ANGULAR = 3.60      # rad/s^2
+
+    # --- Camera geometry and LiDAR fusion ---
+    CAMERA_HFOV_DEG = 57.0        # horizontal field of view; focal length in px = (w/2)/tan(hfov/2)
+    LIDAR_FUSION = True
+    LIDAR_HARD_STOP_M = 0.20      # anything this close dead ahead stops forward motion, whatever the vision says
+    LIDAR_STALE_SEC = 0.6         # older scans are ignored and the vision corridors take over
+    LIDAR_AGREE_FRAC = 0.40       # LiDAR and camera ranges must agree within this fraction to fuse
+    # Identity: a stranger must never inherit the lock. After any loss the owner is only
+    # re-accepted if the appearance score clears this for several consecutive frames.
+    REACQ_THRESHOLD = 0.50
+    REACQ_RELATIVE = 0.85         # ...and 85% of what the owner normally scores while tracked
+    REACQ_CONFIRM_FRAMES = 8
+    TRACK_RELATIVE = 0.75         # while tracking: 75% of the owner's usual score
+    EKF_LEAD_SEC = 0.35           # steer toward where the person will be, not where they were
+
+    # --- PID follow controller (tuned in tests/test_follow_sim.py) ---
+    PID_DIST_KP = 0.60
+    PID_DIST_KI = 0.04
+    PID_DIST_KD = 0.25
+    PID_TURN_KP = 1.50
+    PID_TURN_KI = 0.03
+    PID_TURN_KD = 0.30
+    PID_FF_GAIN = 0.80            # feed-forward on the person's speed along the line of sight
+    PID_MIN_V = 0.06
+    STEERING_DEADZONE_DEG = 2.0
 
     # --- Owner Re-Identification & Identity Protection ---
     IDENTITY_MATCH_THRESHOLD = 0.40        # Minimum score to accept candidate as Owner when bystanders present
@@ -82,8 +113,7 @@ class Config:
     COMMAND_WATCHDOG_TIMEOUT = 0.60        # Seconds before zeroing velocity commands
 
     # --- Hardware Bridge Settings ---
-    COMMAND_MODE = "udp"                   # 'udp', 'http', 'mock'
-    HTTP_CMD_URL = f"http://{PI_IP}:5000/cmd_vel"
-    UDP_HOST = PI_IP
+    COMMAND_MODE = "udp"                   # 'udp' or 'mock'
     UDP_PORT = 8888
+    COMMAND_HZ = 30
     TELEMETRY_HZ = 20

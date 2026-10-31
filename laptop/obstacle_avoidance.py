@@ -42,7 +42,7 @@ class ObstacleAvoidance:
 
         # Sobel vertical gradient: Isolates upright 3D structures (chair legs, boxes, trash bins, walls)
         # while rejecting flat horizontal tile grout lines, carpet seams, and floor lighting glare.
-        sobel_v = cv2.Sobel(blurred, cv2.CV_64F, 1, 0, ksize=3)
+        sobel_v = cv2.Sobel(blurred, cv2.CV_16S, 1, 0, ksize=3)
         sobel_abs = np.uint8(np.clip(np.absolute(sobel_v), 0, 255))
         _, edges = cv2.threshold(sobel_abs, 32, 255, cv2.THRESH_BINARY)
 

@@ -24,6 +24,9 @@ from gesture_recognizer import GestureRecognizer
 from safety_monitor import SafetyMonitor
 from robot_controller import RobotController
 from obstacle_avoidance import ObstacleAvoidance
+import lidar as lidar_lib
+from ekf_person import PersonEKF
+from follow_controller import FollowController
 
 class CVPipeline:
     def __init__(self, model_path=None):
@@ -35,6 +38,25 @@ class CVPipeline:
         self.safety = SafetyMonitor(min_safe_dist=0.55, caution_dist=0.85)
         self.robot = RobotController()
         self.nav = ObstacleAvoidance()
+
+        # Sensor fusion: camera pinhole + LiDAR range -> EKF -> PID
+        self.ekf = PersonEKF()
+        self.follow = FollowController()
+        self.lidar_avoid = lidar_lib.LidarAvoidance()
+        self.lidar_ranges = None
+        self.lidar_time = 0.0
+        self.vision_scale = 1.0       # LiDAR-calibrated correction of the camera distance
+        self.fusion_mode = "CAM"
+        self.last_ctl_t = None
+        self.lidar_clusters = []
+        self.plan = None
+        self.plan_time = 0.0
+        # identity gate
+        self.own_score = 0.6          # running average of the owner's own appearance score while tracked
+        self.reacq_count = 0
+        self.reacq_x = None
+        self.reid = {"state": "IDLE", "own": 0.0, "best": 0.0, "thr": 0.0, "reacq": 0, "confirm": Config.REACQ_CONFIRM_FRAMES}
+        self._last_reid_log = 0.0
         
         # Target Tracking State
         self.target_id = None
@@ -49,7 +71,7 @@ class CVPipeline:
         self.target_kalman = None
 
         # Owner Profile & Biometric Recognition (Saved to Disk)
-        self.owner_profile_file = os.path.join(os.path.dirname(__file__), "owner_profile.pkl")
+        self.owner_profile_file = Config.OWNER_PROFILE_PATH
         self.owner_profile = self.appearance.load_profile(self.owner_profile_file)
         self.owner_enrolled = (self.owner_profile is not None)
         self.owner_match_score = 1.0 if self.owner_enrolled else 0.0
@@ -79,6 +101,7 @@ class CVPipeline:
         # Initialize MediaPipe PoseLandmarker and OpenCV HOG
         self.landmarker = None
         self.hog = None
+        self._pose_ts_ms = 0
         self._init_detectors()
 
         # Landmark skeleton connections
@@ -103,8 +126,8 @@ class CVPipeline:
 
                 options = PoseLandmarkerOptions(
                     base_options=BaseOptions(model_asset_path=self.model_path),
-                    running_mode=VisionRunningMode.IMAGE,
-                    num_poses=4,
+                    running_mode=VisionRunningMode.VIDEO,
+                    num_poses=1,
                     min_pose_detection_confidence=0.5,
                     min_pose_presence_confidence=0.5,
                     min_tracking_confidence=0.5
@@ -171,6 +194,8 @@ class CVPipeline:
         self.owner_enrolled = True
         self.following_enabled = True
         self.owner_match_score = 1.0
+        self.own_score = 0.7
+        self.ekf.reset()
         self.appearance.save_profile(self.owner_profile, self.owner_profile_file)
         self.lock_target(cand["id"], self.owner_profile, cand["bbox"])
         cand["is_owner"] = True
@@ -219,12 +244,144 @@ class CVPipeline:
         self._log_event("FOLLOWING_PAUSED", "Autonomous following paused. Robot stationary.")
         return True
 
+    def set_lidar(self, bins_mm):
+        self.lidar_ranges = lidar_lib.to_meters(bins_mm)
+        self.lidar_clusters = lidar_lib.segment(self.lidar_ranges)
+        self.lidar_time = time.time()
+
+    def set_plan(self, plan):
+        self.plan = plan
+        self.plan_time = time.time()
+
+    def _accept_owner(self, cand, total, n_cands, now, w):
+        """Identity gate. Returns True only if this candidate may be treated as the owner.
+
+        While tracking: appearance must stay near what the owner normally scores and the candidate must be
+        where the EKF expects them. After any loss (left the view, occluded, or the program just started):
+        the appearance score must clear a higher bar for REACQ_CONFIRM_FRAMES consecutive frames at a
+        consistent place, so a stranger who walks in as the owner walks out is rejected."""
+        app = cand.get("similarity_to_owner", 0.0)
+        lost = (self.target_lost_time is not None
+                or self.target_state in (Config.STATE_SEARCHING, Config.STATE_TARGET_TEMPORARILY_LOST)
+                or not self.ekf.active or self.ekf.misses > 8)
+        f_px = (w / 2.0) / math.tan(math.radians(Config.CAMERA_HFOV_DEG) / 2.0)
+        bearing = -math.atan((cand["centroid"][0] - w / 2.0) / f_px)
+        if not lost:
+            thr = max(Config.IDENTITY_MATCH_THRESHOLD, Config.TRACK_RELATIVE * self.own_score)
+            # a person cannot jump: the candidate must be within a few sigma of where the EKF has them
+            px, py = self.ekf.s[0], self.ekf.s[1]
+            r2 = max(px * px + py * py, 0.04)
+            sigma_b = math.sqrt(max(0.0, (px * px * self.ekf.P[1, 1] + py * py * self.ekf.P[0, 0]) / (r2 * r2)))
+            gate = max(math.radians(12.0), 4.0 * sigma_b)
+            in_gate = abs(bearing - self.ekf.range_bearing()[1]) < gate
+            ok = app >= thr and in_gate
+            if ok:
+                self.own_score = 0.9 * self.own_score + 0.1 * app
+            self.reid = {"state": "TRACKING" if ok else "REJECTED", "own": self.own_score, "best": app, "thr": thr,
+                         "reacq": 0, "confirm": Config.REACQ_CONFIRM_FRAMES}
+            self.reacq_count, self.reacq_x = 0, None
+            return ok
+
+        thr = max(Config.REACQ_THRESHOLD, Config.REACQ_RELATIVE * self.own_score)
+        x = cand["centroid"][0]
+        if app >= thr:
+            if self.reacq_x is not None and abs(x - self.reacq_x) > 0.25 * w:
+                self.reacq_count = 0
+            self.reacq_count += 1
+            self.reacq_x = x
+        else:
+            self.reacq_count, self.reacq_x = 0, None
+        ok = self.reacq_count >= Config.REACQ_CONFIRM_FRAMES or app >= 0.85  # near-identical to the enrolment view
+        self.reid = {"state": "REACQUIRED" if ok else "REACQUIRING", "own": self.own_score, "best": app, "thr": thr,
+                     "reacq": self.reacq_count, "confirm": Config.REACQ_CONFIRM_FRAMES}
+        if not ok and app < thr and now - self._last_reid_log > 3.0:
+            self._last_reid_log = now
+            self._log_event("REID_REJECTED", f"Someone else is in view (match {app:.2f} < {thr:.2f}). Not the owner; ignoring them.")
+        if ok:
+            self.reacq_count, self.reacq_x = 0, None
+        return ok
+
+    def _lidar_fresh(self):
+        return (Config.LIDAR_FUSION and self.lidar_ranges is not None
+                and time.time() - self.lidar_time < Config.LIDAR_STALE_SEC)
+
+    def _fuse(self, cand, w, now):
+        """Camera pinhole bearing + range, cross-checked with the LiDAR, filtered by the EKF.
+        Returns (range_m, bearing_rad). Bearing is positive to the left."""
+        f_px = (w / 2.0) / math.tan(math.radians(Config.CAMERA_HFOV_DEG) / 2.0)
+        cx = cand["centroid"][0]
+        bearing_cam = -math.atan((cx - w / 2.0) / f_px)
+        vis_d = cand["distance_m"] * self.vision_scale
+        v_r, w_r = self.robot.current_linear, self.robot.current_angular
+
+        lidar_r = lidar_b = None
+        if self._lidar_fresh():
+            near = self.ekf.range_bearing()[0] if self.ekf.active else vis_d
+            pc = lidar_lib.person_cluster(self.lidar_clusters, bearing_cam, near)
+            if pc is not None:
+                lidar_r, lidar_b = pc["range"], pc["bearing"]
+                if abs(lidar_r - vis_d) > Config.LIDAR_AGREE_FRAC * max(vis_d, lidar_r) and not self.ekf.active:
+                    lidar_r = None
+        self.fusion_mode = "LIDAR+CAM" if lidar_r is not None else "CAM"
+
+        if not self.ekf.active or self.ekf.rejects >= 6:
+            self.ekf.init(lidar_r if lidar_r is not None else vis_d, bearing_cam, now)
+            self.follow.reset()
+        else:
+            self.ekf.predict(now, v_r, w_r)
+            self.ekf.update(vis_d, bearing_cam, 0.12 * vis_d, math.radians(1.5))
+            if lidar_r is not None:
+                if self.ekf.update(lidar_r, lidar_b, 0.05, math.radians(1.0)):
+                    # the LiDAR is the better ruler: slowly correct the camera's size-based distance
+                    ratio = lidar_r / max(cand["distance_m"], 0.1)
+                    self.vision_scale = max(0.6, min(1.6, 0.98 * self.vision_scale + 0.02 * ratio))
+        r, b = self.ekf.range_bearing()
+        return r, b, f_px
+
+    def _follow_command(self, cand, bearing, rng, f_px, dist_for_dt, obs_dists, now):
+        """EKF-fed PID, then the LiDAR (or camera-corridor) avoidance layer."""
+        dt = 0.05 if self.last_ctl_t is None else now - self.last_ctl_t
+        self.last_ctl_t = now
+        lead = Config.EKF_LEAD_SEC
+        lx, ly = self.ekf.predicted(lead)
+        b_ctl = math.atan2(ly, lx) if lx > 0.1 else bearing
+        plan = self.plan if self.plan is not None and time.time() - self.plan_time < 0.8 else None
+        detour = plan is not None and plan.get("blocked")
+        if detour and plan.get("wp_bearing") is not None:
+            b_ctl = plan["wp_bearing"]          # steer at the waypoint round the obstacle, not through it
+        ux, uy = self.ekf.s[2], self.ekf.s[3]
+        los = (self.ekf.s[0] * ux + self.ekf.s[1] * uy) / max(rng, 0.1)
+        v, w_cmd = self.follow.command(rng, b_ctl, self.ekf.range_rate(),
+                                       self.ekf.bearing_rate(self.robot.current_angular), los, dt,
+                                       desired=self.base_target_distance)
+        if self._lidar_fresh():
+            x1, _, x2, _ = cand["bbox"]
+            half = math.atan(0.5 * (x2 - x1) / f_px) + 0.06
+            sec = lidar_lib.sectors(self.lidar_ranges, exclude=(bearing, half, rng))
+            self.robot.set_front_clearance(sec["front_raw"], self.lidar_time)
+            v, w_cmd, status = self.lidar_avoid.apply(v, w_cmd, sec)
+            self._lidar_sectors = sec
+            if detour and status == "LIDAR_CLEAR":
+                status = "DETOUR" if plan.get("wp_bearing") is not None else "NO_PATH"
+                if plan.get("wp_bearing") is None:
+                    v = 0.0
+            return v, w_cmd, status
+        safe_w, scale, status = self.nav.compute_safe_steering(math.tan(-bearing) / math.tan(math.radians(Config.CAMERA_HFOV_DEG) / 2.0),
+                                                               obstacle_distances=obs_dists)
+        if status != "PATH_CLEAR":
+            return v * scale, safe_w, status
+        return v, w_cmd, status
+
     def process_frame(self, frame):
         """
         Main pipeline execution on a single video frame.
         Returns: (telemetry_dict, annotated_frame)
         """
         h, w = frame.shape[:2]
+        if w > 480:
+            new_h = max(1, int(round(h * (480.0 / w))))
+            frame = cv2.resize(frame, (480, new_h), interpolation=cv2.INTER_LINEAR)
+            h, w = frame.shape[:2]
         annotated = frame.copy()
         now = time.time()
 
@@ -316,8 +473,7 @@ class CVPipeline:
                         best_score = cand["similarity_to_target"]
                         best_cand = cand
 
-                owner_threshold = Config.IDENTITY_SINGLE_PERSON_THRESHOLD if len(candidates) == 1 else Config.IDENTITY_MATCH_THRESHOLD
-                if best_cand is not None and best_score >= owner_threshold:
+                if best_cand is not None and self._accept_owner(best_cand, best_score, len(candidates), now, w):
                     if self.target_state in [Config.STATE_SEARCHING, Config.STATE_TARGET_TEMPORARILY_LOST]:
                         self._log_event("TARGET_REACQUIRED", f"Owner re-acquired! Re-ID confidence: {best_score:.2f}")
                     self.target_lost_time = None
@@ -372,6 +528,8 @@ class CVPipeline:
         # Step 4: Lost-Human Trajectory Projection (Conservative stop, no blind rotation)
         projected_bbox = None
         if self.target_state == Config.STATE_TARGET_TEMPORARILY_LOST:
+            if self.target_lost_time is None:
+                self.target_lost_time = now
             occlusion_duration = now - self.target_lost_time
             if occlusion_duration <= self.max_recovery_seconds and self.target_kalman is not None:
                 projected_bbox, (vx, vy) = self.target_kalman.predict()
@@ -412,26 +570,21 @@ class CVPipeline:
 
         v_x, w_z = 0.0, 0.0
         if matched_target is not None:
-            raw_dist = matched_target["distance_m"]
-            cx, cy = matched_target["centroid"]
-            offset_x_norm = (cx - (w / 2.0)) / (w / 2.0)
+            fused_r, fused_b, f_px = self._fuse(matched_target, w, now)
+            tan_half = math.tan(math.radians(Config.CAMERA_HFOV_DEG) / 2.0)
+            offset_x_norm = math.tan(-fused_b) / tan_half   # positive = person on the right of the image
 
             # Record last known offset & direction for search re-acquisition
             self.last_exit_offset_x = offset_x_norm
             self.last_exit_direction = 1 if offset_x_norm >= 0 else -1
             self.target_lost_time = None
 
-            # Temporal smoothing (Snappy, low-latency EMA)
-            if self.smooth_distance is None:
-                self.smooth_distance = raw_dist
-                self.smooth_offset_x = offset_x_norm
-            else:
-                self.smooth_distance = 0.70 * raw_dist + 0.30 * self.smooth_distance
-                self.smooth_offset_x = 0.75 * offset_x_norm + 0.25 * self.smooth_offset_x
+            self.smooth_distance = fused_r
+            self.smooth_offset_x = offset_x_norm
 
-            telemetry["distance_m"] = round(float(self.smooth_distance), 2)
-            telemetry["offset_x_norm"] = round(float(self.smooth_offset_x), 3)
-            telemetry["offset_deg"] = round(telemetry["offset_x_norm"] * 32.0, 1)
+            telemetry["distance_m"] = round(float(fused_r), 2)
+            telemetry["offset_x_norm"] = round(float(offset_x_norm), 3)
+            telemetry["offset_deg"] = round(math.degrees(-fused_b), 1)
 
             dist = telemetry["distance_m"]
             offset_x = telemetry["offset_x_norm"]
@@ -466,12 +619,8 @@ class CVPipeline:
                         self.target_state = Config.STATE_FOLLOWING
 
                     if self.target_state == Config.STATE_FOLLOWING:
-                        # Follow forward with smooth proportional speed
-                        dist_err = dist - Config.DESIRED_DISTANCE
-                        v_x = min(Config.MAX_LINEAR_VEL, max(Config.MIN_ROLLING_VEL, Config.MIN_ROLLING_VEL + dist_err * 0.50))
-                        safe_w, speed_scale, nav_status = self.nav.compute_safe_steering(offset_x, obstacle_distances=obs_dists)
-                        v_x = v_x * speed_scale
-                        w_z = safe_w
+                        # EKF-fed PID, then LiDAR avoidance
+                        v_x, w_z, nav_status = self._follow_command(matched_target, fused_b, fused_r, f_px, dist, obs_dists, now)
                         telemetry["nav_status"] = nav_status
                     else:
                         v_x = 0.0
@@ -485,17 +634,21 @@ class CVPipeline:
                         else:
                             w_z = 0.0
                     else:
-                        # Continue following
-                        dist_err = dist - Config.DESIRED_DISTANCE
-                        v_x = min(Config.MAX_LINEAR_VEL, max(Config.MIN_ROLLING_VEL, Config.MIN_ROLLING_VEL + dist_err * 0.50))
-                        safe_w, speed_scale, nav_status = self.nav.compute_safe_steering(offset_x, obstacle_distances=obs_dists)
-                        v_x = v_x * speed_scale
-                        w_z = safe_w
+                        # EKF-fed PID, then LiDAR avoidance
+                        v_x, w_z, nav_status = self._follow_command(matched_target, fused_b, fused_r, f_px, dist, obs_dists, now)
                         telemetry["nav_status"] = nav_status
 
             telemetry["phase2_cmd_vel"] = {"linear_x": round(v_x, 2), "angular_z": round(w_z, 2)}
         else:
             # No owner target matched in frame (owner exited frame or is occluded)
+            self.follow.reset()
+            self.last_ctl_t = None
+            if self.ekf.active:
+                self.ekf.predict(now, self.robot.current_linear, self.robot.current_angular)
+                if self.ekf.misses > 40 or (self.target_lost_time is not None and now - self.target_lost_time > self.max_recovery_seconds):
+                    self.ekf.reset()
+                else:
+                    self.last_exit_direction = 1 if self.ekf.s[1] < 0 else -1  # predicted to be on the right
             if self.owner_enrolled and self.following_enabled:
                 if self.target_lost_time is None:
                     self.target_lost_time = now
@@ -555,6 +708,27 @@ class CVPipeline:
             self.robot.update_auto_commands(0.0, 0.0, can_move=False)
 
         telemetry["robot_telemetry"] = self.robot.get_telemetry()
+        telemetry["person"] = self.ekf.as_dict() if self.ekf.active else None
+        telemetry["reid"] = dict(self.reid) if self.owner_enrolled else None
+        telemetry["fusion"] = {"mode": self.fusion_mode if matched_target is not None else "LOST",
+                               "vision_scale": round(self.vision_scale, 3),
+                               "lidar": self._lidar_fresh(),
+                               "sectors": getattr(self, "_lidar_sectors", None) if self._lidar_fresh() else None}
+
+        overlay = []
+        for cand in candidates:
+            x1, y1, x2, y2 = cand["bbox"]
+            overlay.append({
+                "bbox": [
+                    round(x1 / float(w), 4),
+                    round(y1 / float(h), 4),
+                    round(x2 / float(w), 4),
+                    round(y2 / float(h), 4),
+                ],
+                "target": bool(cand.get("is_target") or cand.get("is_owner")),
+                "pose": cand.get("pose_norm") or [],
+            })
+        telemetry["overlay"] = overlay
 
         # Step 7: Render Tactical HUD with Obstacle Corridors
         self._render_tactical_hud(annotated, candidates, matched_target, telemetry, w, h, corridor_boxes)
@@ -572,7 +746,8 @@ class CVPipeline:
             try:
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-                res = self.landmarker.detect(mp_image)
+                self._pose_ts_ms += 33
+                res = self.landmarker.detect_for_video(mp_image, self._pose_ts_ms)
 
                 if res.pose_landmarks and len(res.pose_landmarks) > 0:
                     for lm in res.pose_landmarks:
@@ -613,28 +788,33 @@ class CVPipeline:
                             if sh_l and sh_r and sh_l[2] > 0.35 and sh_r[2] > 0.35:
                                 sh_w = math.hypot(sh_r[0] - sh_l[0], sh_r[1] - sh_l[1])
                                 if sh_w > 15:
-                                    dist_estimates.append(235.0 / sh_w)
+                                    dist_estimates.append((235.0 / sh_w) * (w / 640.0))
 
                             if hip_l and hip_r and hip_l[2] > 0.35 and hip_r[2] > 0.35:
                                 hip_w = math.hypot(hip_r[0] - hip_l[0], hip_r[1] - hip_l[1])
                                 if hip_w > 15:
                                     # Pelvic bi-iliac width (~30cm) vs shoulder (~44cm)
-                                    dist_estimates.append(160.0 / hip_w)
+                                    dist_estimates.append((160.0 / hip_w) * (w / 640.0))
 
                             if sh_l and sh_r and hip_l and hip_r:
                                 th1 = abs(hip_l[1] - sh_l[1])
                                 th2 = abs(hip_r[1] - sh_r[1])
                                 torso_h = max(th1, th2)
                                 if torso_h > 35:
-                                    dist_estimates.append(230.0 / float(torso_h))
+                                    dist_estimates.append((230.0 / float(torso_h)) * (w / 640.0))
 
                             if dist_estimates:
                                 dist_m = sum(dist_estimates) / len(dist_estimates)
                             else:
                                 bbox_h = max(40, y2 - y1)
-                                dist_m = 320.0 / float(bbox_h)
+                                dist_m = (320.0 / float(bbox_h)) * (w / 640.0)
 
                             dist_m = max(0.35, min(4.50, dist_m))
+
+                            pose_norm = [
+                                [int(i), round(pts[i][0] / float(w), 4), round(pts[i][1] / float(h), 4), round(float(pts[i][2]), 3)]
+                                for i in pts
+                            ]
 
                             candidates.append({
                                 "id": person_counter,
@@ -643,6 +823,7 @@ class CVPipeline:
                                 "signature": sig,
                                 "distance_m": round(dist_m, 2),
                                 "landmarks": lm,
+                                "pose_norm": pose_norm,
                                 "is_target": False,
                                 "confidence": 0.95
                             })
