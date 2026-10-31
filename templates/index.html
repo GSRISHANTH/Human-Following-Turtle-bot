@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TurtleBot Vision-Based Human Following // Complete System</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Top Navigation Header -->
+        <header class="app-header">
+            <div class="brand">
+                <div class="logo-mark">
+                    <span class="pulse-ring"></span>
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="9"/>
+                        <path d="M12 3v6m0 6v6M3 12h6m6 0h6"/>
+                    </svg>
+                </div>
+                <div>
+                    <h1 class="app-title">TURTLEBOT HUMAN FOLLOWING <span class="tag">FULL AUTONOMY</span></h1>
+                    <p class="app-subtitle">MediaPipe Pose &bull; Multi-Person Disambiguation &bull; Active Recovery &bull; Motor Drive</p>
+                </div>
+            </div>
+
+            <div class="header-status">
+                <div class="status-pill" id="conn-pill">
+                    <span class="status-dot" id="conn-dot"></span>
+                    <span id="conn-text">Connecting to Pi...</span>
+                </div>
+                <div class="metric-chip">
+                    <span class="metric-label">FPS</span>
+                    <span class="metric-val highlight" id="fps-val">--</span>
+                </div>
+                <div class="metric-chip">
+                    <span class="metric-label">SAFETY STATUS</span>
+                    <span class="metric-val highlight-green" id="safety-head-val">SAFE</span>
+                </div>
+                <div class="metric-chip">
+                    <span class="metric-label">ROBOT MODE</span>
+                    <span class="metric-val highlight" id="robot-mode-val">AUTO</span>
+                </div>
+                <button id="btn-estop" class="btn btn-estop" title="Emergency Stop Motors">E-STOP</button>
+            </div>
+        </header>
+
+        <!-- Main Workspace: Dual Video Feeds -->
+        <main class="video-grid">
+            <!-- Feed 1: Raw Raspberry Pi Stream -->
+            <section class="video-card" id="card-raw">
+                <div class="video-card-header">
+                    <div class="stream-badge raw-badge">
+                        <span class="badge-dot"></span>
+                        <span>FEED 1: RAW RASPBERRY PI</span>
+                    </div>
+                    <span class="stream-ip" id="display-stream-ip">http://{{ pi_ip }}:5000</span>
+                </div>
+
+                <div class="video-wrapper">
+                    <img id="raw-stream-img" src="/stream/raw" alt="Raspberry Pi Raw Stream">
+                    <div class="video-overlay top-left">
+                        <span class="overlay-tag">SOURCE: PI WEBCAM</span>
+                        <span class="overlay-tag" id="raw-res">640x480</span>
+                    </div>
+                </div>
+
+                <div class="video-card-footer">
+                    <span class="footer-info">Live low-latency MJPEG feed streamed over Wi-Fi from robot</span>
+                </div>
+            </section>
+
+            <!-- Feed 2: Processed MediaPipe AI Stream -->
+            <section class="video-card" id="card-processed">
+                <div class="video-card-header">
+                    <div class="stream-badge ai-badge">
+                        <span class="badge-dot pulse-glow"></span>
+                        <span>FEED 2: AI POSE, RE-ID &amp; MOTION</span>
+                    </div>
+                    <div class="target-indicator" id="target-pill">
+                        <span class="indicator-dot"></span>
+                        <span id="target-pill-text">SEARCHING</span>
+                    </div>
+                </div>
+
+                <div class="video-wrapper">
+                    <img id="processed-stream-img" src="/stream/processed" alt="AI Processed Stream">
+                    <div class="video-overlay top-left">
+                        <span class="overlay-tag ai-tag">CV ENGINE ACTIVE</span>
+                        <span class="overlay-tag" id="distance-badge">-- m</span>
+                    </div>
+                    <div class="video-overlay bottom-right">
+                        <span class="overlay-tag" id="gesture-overlay">GESTURE: NONE</span>
+                        <span class="overlay-tag" id="offset-badge">OFFSET: 0.0&deg;</span>
+                    </div>
+                </div>
+
+                <div class="video-card-footer">
+                    <span class="footer-info">Skeletal tracking, target lock reticle, disambiguation tags, and Kalman trajectory projection</span>
+                </div>
+            </section>
+        </main>
+
+        <!-- Comprehensive Intelligence & Motion Deck -->
+        <section class="dashboard-deck">
+            <!-- Card 1: Person Identification & Multi-Person Disambiguation -->
+            <div class="deck-card">
+                <div class="card-title">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+                        <circle cx="12" cy="7" r="4"/>
+                    </svg>
+                    <span>OWNER RECOGNITION &amp; RE-ID</span>
+                </div>
+
+                <div class="reid-status-box">
+                    <div class="reid-swatch-col">
+                        <div class="color-swatch-circle" id="target-color-swatch"></div>
+                        <span class="swatch-label">Signature</span>
+                    </div>
+                    <div class="reid-details-col">
+                        <div class="reid-id-tag" id="target-id-label">TARGET: #1</div>
+                        <div class="reid-state" id="target-state-label">STATE: TRACKING</div>
+                        <div class="owner-status-tag" id="owner-status-tag" style="font-size: 0.78rem; font-weight: 700; color: #00ff78; margin-top: 4px;">
+                            ★ OWNER: SEARCHING
+                        </div>
+                        <div class="reid-people-count" id="people-count-label">People in view: 1</div>
+                    </div>
+                </div>
+
+                <div class="deck-action-row" style="display: flex; gap: 8px; flex-wrap: wrap;">
+                    <button id="btn-enroll-owner" class="btn btn-primary" style="flex: 1 1 100%; background: linear-gradient(135deg, #00a85a, #006638); border: 1px solid #00ff88; color: #ffffff; font-weight: 700; cursor: pointer; padding: 10px 14px; border-radius: 6px; box-shadow: 0 0 10px rgba(0, 255, 120, 0.3);">
+                        ★ LOCK / ENROLL OWNER
+                    </button>
+                    <button id="btn-start-follow" class="btn btn-primary" style="flex: 1; background: #0077cc; border-color: #00aaff; color: #ffffff; font-weight: 600; cursor: pointer;">
+                        ▶ START FOLLOWING
+                    </button>
+                    <button id="btn-pause-follow" class="btn btn-secondary" style="flex: 1; background: #333344; border-color: #ffaa00; color: #ffcc00; font-weight: 600; cursor: pointer;">
+                        ⏸ PAUSE
+                    </button>
+                    <button id="btn-release-owner" class="btn btn-secondary" style="flex: 1; border-color: rgba(255,80,80,0.5); color: #ff8888; font-weight: 600; cursor: pointer;">
+                        ✖ RELEASE OWNER
+                    </button>
+                </div>
+
+                <p class="card-hint">
+                    Stand in front and click <strong>"ENROLL AS OWNER"</strong> or raise one hand high (<strong>FOLLOW ME</strong> gesture). The robot learns your biometric profile and follows <strong>ONLY you</strong>, ignoring other bystanders.
+                </p>
+            </div>
+
+            <!-- Card 2: Dynamic Distance & Alignment -->
+            <div class="deck-card">
+                <div class="card-title">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/>
+                    </svg>
+                    <span>DYNAMIC DISTANCE ESTIMATION</span>
+                </div>
+                <div class="dist-display">
+                    <div class="dist-big">
+                        <span id="dist-number">--</span>
+                        <span class="dist-unit">m</span>
+                    </div>
+                    <div class="dist-status-badge" id="dist-status-badge">SEARCHING</div>
+                </div>
+
+                <!-- Distance Scale Bar -->
+                <div class="gauge-container">
+                    <div class="gauge-labels">
+                        <span>0.5m (Close)</span>
+                        <span id="label-dyn-dist">Dynamic: 1.3m</span>
+                        <span>3.0m (Far)</span>
+                    </div>
+                    <div class="gauge-bar-bg">
+                        <div class="gauge-target-zone"></div>
+                        <div class="gauge-marker" id="dist-marker"></div>
+                    </div>
+                </div>
+
+                <!-- Horizon Steering Balance Bar -->
+                <div class="horizon-wrapper">
+                    <div class="horizon-labels">
+                        <span>&larr; LEFT</span>
+                        <span id="align-angle-sub">OFFSET: 0.0&deg;</span>
+                        <span>RIGHT &rarr;</span>
+                    </div>
+                    <div class="horizon-track">
+                        <div class="horizon-center-line"></div>
+                        <div class="horizon-deadzone"></div>
+                        <div class="horizon-pointer" id="horizon-pointer"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Card 3: Active TurtleBot Motor Drive & Teleop Deck -->
+            <div class="deck-card">
+                <div class="card-title">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="2" y="3" width="20" height="14" rx="2" ry="2"/>
+                        <line x1="8" y1="21" x2="16" y2="21"/>
+                        <line x1="12" y1="17" x2="12" y2="21"/>
+                    </svg>
+                    <span>TURTLEBOT MOTOR DRIVE &amp; TELEOP</span>
+                </div>
+
+                <div class="mode-select-row">
+                    <button id="btn-mode-auto" class="btn btn-mode active">AUTO FOLLOW</button>
+                    <button id="btn-mode-manual" class="btn btn-mode">MANUAL TELEOP</button>
+                    <button id="btn-test-motors" class="btn btn-mode" style="border-color: var(--neon-amber); color: var(--neon-amber);" title="Spin wheels for 1.2s to test hardware">TEST MOTORS</button>
+                </div>
+
+                <div class="cmd-preview-grid">
+                    <div class="cmd-box">
+                        <span class="cmd-label">LINEAR VEL (v_x)</span>
+                        <span class="cmd-val" id="cmd-linear">0.00 m/s</span>
+                    </div>
+                    <div class="cmd-box">
+                        <span class="cmd-label">ANGULAR VEL (&omega;_z)</span>
+                        <span class="cmd-val" id="cmd-angular">0.00 rad/s</span>
+                    </div>
+                </div>
+
+                <!-- Virtual Teleop D-Pad -->
+                <div class="dpad-container" id="dpad-container">
+                    <div class="dpad-row">
+                        <button class="dpad-btn" id="dpad-up" title="Drive Forward (W)">▲</button>
+                    </div>
+                    <div class="dpad-row">
+                        <button class="dpad-btn" id="dpad-left" title="Turn Left (A)">◀</button>
+                        <button class="dpad-btn dpad-stop" id="dpad-center" title="Halt (Space)">■</button>
+                        <button class="dpad-btn" id="dpad-right" title="Turn Right (D)">▶</button>
+                    </div>
+                    <div class="dpad-row">
+                        <button class="dpad-btn" id="dpad-down" title="Reverse (S)">▼</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Card 4: Event Log, Safety & Connection -->
+            <div class="deck-card">
+                <div class="card-title">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polyline points="4 17 10 11 4 5"/>
+                        <line x1="12" y1="19" x2="20" y2="19"/>
+                    </svg>
+                    <span>SYSTEM EVENT LOG &amp; SAFETY</span>
+                </div>
+
+                <div class="safety-box" id="safety-box">
+                    <div class="safety-status-row">
+                        <span class="safety-dot" id="safety-dot"></span>
+                        <span class="safety-status-title" id="safety-status-title">STATUS: SAFE</span>
+                    </div>
+                    <div class="safety-alerts" id="safety-alerts">Nominal. All zones clear.</div>
+                </div>
+
+                <!-- Event Log Terminal -->
+                <div class="event-terminal" id="event-terminal">
+                    <div class="log-entry system">[SYSTEM] Full autonomy engine active.</div>
+                </div>
+
+                <div class="control-row">
+                    <div class="toggle-buttons">
+                        <button id="btn-mode-network" class="btn btn-toggle active">Pi Live Stream</button>
+                        <button id="btn-mode-sim" class="btn btn-toggle">Simulation Mode</button>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </div>
+
+    <script src="/static/js/dashboard.js"></script>
+</body>
+</html>
