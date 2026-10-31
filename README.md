@@ -4,7 +4,7 @@ An end-to-end intelligent human-following mobile robot using a **distributed arc
 - **Laptop (AI & Intelligence Hub)**: Runs all computer vision, MediaPipe pose tracking, multi-template HSV person Re-ID, obstacle corridor detection, directional search rotation, and the interactive web control dashboard.
 - **TurtleBot3 Burger + Raspberry Pi 4 (Hardware & Motor Interface)**: Handles camera hardware video acquisition, streaming, ROS 2 Humble OpenCR motor communication, and local safety watchdog.
 
----
+--- 
 
 ## Table of Contents
 1. [Distributed System Architecture](#1-distributed-system-architecture)
