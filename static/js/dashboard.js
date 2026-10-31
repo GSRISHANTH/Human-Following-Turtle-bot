@@ -160,7 +160,10 @@ document.addEventListener("DOMContentLoaded", () => {
 
             // Target Indicator Pill on Video
             if (targetPill && targetPillText) {
-                if (data.owner_enrolled && data.is_owner_matched) {
+                if (data.fusion && data.fusion.lidar_only) {
+                    targetPill.className = "target-indicator locked";
+                    targetPillText.textContent = `★ OWNER (LIDAR) [${targetState}]`;
+                } else if (data.owner_enrolled && data.is_owner_matched) {
                     targetPill.className = "target-indicator locked";
                     targetPillText.textContent = `★ OWNER #${targetId} [${targetState}]`;
                 } else if (targetState === "TRACKING" || targetState === "REACQUIRED") {
@@ -169,6 +172,9 @@ document.addEventListener("DOMContentLoaded", () => {
                 } else if (targetState === "OCCLUDED") {
                     targetPill.className = "target-indicator searching";
                     targetPillText.textContent = "OCCLUDED (PREDICTING)";
+                } else if (targetState === "RECALLING_LAST_POSITION") {
+                    targetPill.className = "target-indicator searching";
+                    targetPillText.textContent = "RECALLING LAST POSITION (MAP)";
                 } else if (targetState === "SEARCH_ROTATING") {
                     targetPill.className = "target-indicator searching";
                     targetPillText.textContent = "360° SEARCH ROTATING";
@@ -321,7 +327,7 @@ document.addEventListener("DOMContentLoaded", () => {
         setText("lh-pi", havePi ? "ONLINE" : (d.source_mode === "sim" ? "SIM" : "SILENT"), havePi ? "ok" : d.source_mode === "sim" ? "warn" : "bad");
         setText("lh-ros", havePi ? (pi.ros || (pi.serial ? "SERIAL" : "NONE")) : "--", havePi && (pi.ros || pi.serial) ? "ok" : "warn");
         setText("lh-subs", havePi ? `${pi.subs}` : "--", havePi && pi.subs > 0 ? "ok" : "warn");
-        setText("lh-motors", havePi ? (pi.motors ? "ENABLED" : "OFF (no-motors)") : "--", havePi && pi.motors ? "ok" : "warn");
+        setText("lh-motors", havePi ? (!pi.motors ? "OFF (no-motors)" : pi.torque ? "TORQUE ON" : "TORQUE OFF") : "--", havePi && pi.motors && pi.torque ? "ok" : "warn");
         setText("lh-cmdage", havePi && pi.cmd_age != null ? `${(pi.cmd_age * 1000).toFixed(0)} ms` : "--", havePi && pi.cmd_age != null && pi.cmd_age < 0.2 ? "ok" : "warn");
         setText("lh-picam", havePi ? `${pi.cam_fps} fps${pi.raw ? " raw" : ""}` : "--");
 
@@ -367,12 +373,12 @@ document.addEventListener("DOMContentLoaded", () => {
         const p = d.person;
         setText("fu-speed", p ? `${p.speed.toFixed(2)} m/s` : "--");
         setText("fu-head", p && p.speed > 0.05 ? `${(Math.atan2(p.vy, p.vx) * 180 / Math.PI).toFixed(0)}\u00b0` : "--");
-        setText("fu-scale", f.vision_scale ? `x${f.vision_scale.toFixed(2)}` : "--");
+        setText("fu-scale", f.vision_scale ? `x${f.vision_scale.toFixed(2)}  bearing ${f.bearing_bias_deg >= 0 ? "+" : ""}${f.bearing_bias_deg}°` : "--");
         const loc = d.localization;
         setText("loc-pose", loc ? `${loc.x.toFixed(2)}, ${loc.y.toFixed(2)} m  ${loc.yaw.toFixed(0)}\u00b0` : "no odometry");
         setText("loc-q", loc ? (loc.scans < 25 ? `mapping ${loc.scans}/25` : `match ${loc.score.toFixed(2)}  drift fixed ${loc.shift.toFixed(2)} m`) : "--", loc && loc.scans >= 25 && loc.score > 0.3 ? "ok" : "warn");
         const ps = d.plan_status || "--";
-        setText("plan-status", ps, ps === "DETOUR" ? "warn" : ps === "NO_PATH" ? "bad" : "ok");
+        setText("plan-status", ps, ps.includes("DETOUR") || ps.startsWith("MEMORY") ? "warn" : ps.includes("NO_PATH") ? "bad" : "ok");
         setText("loc-moving", loc ? `${loc.moving}` : "--");
 
         const r = d.reid;
@@ -391,6 +397,21 @@ document.addEventListener("DOMContentLoaded", () => {
         }
         const pi = d.pi || {};
         setText("lh-scan", pi.scan_hz != null ? (pi.scan_hz > 0 ? `${pi.scan_hz.toFixed(0)} Hz` : "none") : "--", pi.scan_hz > 3 ? "ok" : "warn");
+    }
+
+    // Follow distance: the robot waits at this range and resumes when the person moves 15 cm beyond it
+    const followDist = document.getElementById("follow-dist");
+    const followDistVal = document.getElementById("follow-dist-val");
+    if (followDist) {
+        let editing = false;
+        fetch("/api/config").then((r) => r.json()).then((c) => {
+            if (c.target_distance) { followDist.value = c.target_distance; followDistVal.textContent = `${Number(c.target_distance).toFixed(2)} m`; }
+        }).catch(() => {});
+        followDist.addEventListener("input", () => { editing = true; followDistVal.textContent = `${Number(followDist.value).toFixed(2)} m`; });
+        followDist.addEventListener("change", async () => {
+            await fetch("/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ target_distance: Number(followDist.value) }) });
+            editing = false;
+        });
     }
 
     const btnLidarReset = document.getElementById("btn-lidar-reset");
@@ -550,7 +571,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     // Teleop. The Pi stops the wheels 0.6 s after the last packet, so a held input must keep sending.
-    const SPEED = { fwd: 0.18, back: -0.12, turn: 0.70 };
+    const SPEED = { fwd: 0.20, back: -0.12, turn: 1.20 };
     const heldKeys = new Set();
     let padDir = null;
     let teleopTimer = null;

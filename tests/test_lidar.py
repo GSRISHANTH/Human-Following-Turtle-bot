@@ -112,3 +112,35 @@ class Map(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BadOdometry(unittest.TestCase):
+    """A NaN or a restarted odometry must never kill the map (this blanked the dashboard map for a whole session)."""
+
+    def _warm(self):
+        m = lidar.LidarMap()
+        scan = [1500] * 360
+        for _ in range(30):
+            m.update(scan, (0.0, 0.0, 0.0))
+        return m, scan
+
+    def test_nan_odometry_is_ignored_and_rendering_still_works(self):
+        m, scan = self._warm()
+        m.update(scan, (float("nan"), 0.0, 0.0))
+        m.update(scan, (0.0, 0.0, 0.0))
+        self.assertEqual(m.render().shape[2], 3)
+        self.assertTrue(all(math.isfinite(x) and math.isfinite(y) for x, y in m.trail))
+
+    def test_odometry_restart_starts_a_new_map_instead_of_smearing(self):
+        m, scan = self._warm()
+        before = m.scans
+        m.update(scan, (6.0, 16.0, 1.2))       # the Pi rebooted: odometry is in a different frame
+        self.assertEqual(m.resets, 1)
+        self.assertLess(m.scans, before)
+        self.assertEqual(m.render().shape[2], 3)
+
+    def test_normal_motion_is_not_mistaken_for_a_restart(self):
+        m, scan = self._warm()
+        for i in range(10):
+            m.update(scan, (0.05 * (i + 1), 0.0, 0.01 * i))
+        self.assertEqual(m.resets, 0)

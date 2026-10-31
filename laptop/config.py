@@ -43,14 +43,15 @@ class Config:
     STATE_TARGET_TEMPORARILY_LOST = "TARGET_TEMPORARILY_LOST"
     STATE_SEARCHING = "SEARCH_ROTATING"
     STATE_TARGET_AMBIGUOUS = "TARGET_AMBIGUOUS"
+    STATE_RECOVERING = "RECALLING_LAST_POSITION"
     STATE_SAFETY_STOP = "SAFETY_STOP"
     STATE_MANUAL_CONTROL = "MANUAL_CONTROL"
     STATE_OWNER_RELEASED = "OWNER_RELEASED"
 
     # --- Target Loss & Active Search ---
-    SEARCH_ROTATION_SPEED = 0.35          # Slow, safe search angular velocity (rad/s)
-    SEARCH_MAX_DURATION_SEC = 6.0         # Max seconds to search before timing out and stopping
-    SEARCH_START_DELAY_SEC = 0.6          # Seconds after losing target before starting rotation
+    SEARCH_ROTATION_SPEED = 0.60          # Slow, safe search angular velocity (rad/s)
+    SEARCH_MAX_DURATION_SEC = 30.0        # Max seconds to search before timing out and stopping
+    SEARCH_START_DELAY_SEC = 0.4          # Seconds after losing target before starting rotation
 
     # --- Following & Distance Hysteresis (Meters) ---
     DESIRED_DISTANCE = 1.20       # Desired following distance
@@ -63,13 +64,13 @@ class Config:
     # --- PID & Velocity Control Limits ---
     MAX_LINEAR_VEL = 0.22         # Physical limit for TurtleBot3 Burger (m/s)
     MIN_ROLLING_VEL = 0.08        # Minimum speed to overcome static carpet/tile wheel friction (m/s)
-    MAX_ANGULAR_VEL = 1.20        # Maximum angular velocity (rad/s)
+    MAX_ANGULAR_VEL = 2.00        # Maximum angular velocity (rad/s)
     STEERING_DEADZONE = 0.05      # ±5% normalized horizontal deadzone
     ANGULAR_DEADZONE = STEERING_DEADZONE  # Compatibility alias
     
     # Slew-rate acceleration limits
-    MAX_ACCEL_LINEAR = 0.90       # m/s^2
-    MAX_ACCEL_ANGULAR = 3.60      # rad/s^2
+    MAX_ACCEL_LINEAR = 1.60       # m/s^2
+    MAX_ACCEL_ANGULAR = 8.00      # rad/s^2
 
     # --- Camera geometry and LiDAR fusion ---
     CAMERA_HFOV_DEG = 57.0        # horizontal field of view; focal length in px = (w/2)/tan(hfov/2)
@@ -79,19 +80,28 @@ class Config:
     LIDAR_AGREE_FRAC = 0.40       # LiDAR and camera ranges must agree within this fraction to fuse
     # Identity: a stranger must never inherit the lock. After any loss the owner is only
     # re-accepted if the appearance score clears this for several consecutive frames.
-    REACQ_THRESHOLD = 0.50
-    REACQ_RELATIVE = 0.85         # ...and 85% of what the owner normally scores while tracked
-    REACQ_CONFIRM_FRAMES = 8
-    TRACK_RELATIVE = 0.75         # while tracking: 75% of the owner's usual score
+    REACQ_THRESHOLD = 0.40
+    REACQ_RELATIVE = 0.60         # ...and 60% of what the owner normally scores while tracked
+    REACQ_CONFIRM_FRAMES = 5
+    TRACK_RELATIVE = 0.50         # while the track is alive: position continuity is the main evidence
+    LIDAR_TRACK_MAX_SEC = 12.0    # keep following on LiDAR alone this long when the camera cannot see the owner
+    LIDAR_TRACK_GATE_M = 0.50     # LiDAR person-cluster must be this close to where the EKF expects the owner
+    MEMORY_PURSUIT_SEC = 25.0     # drive to where the owner was last seen (around obstacles) for up to this long
+    MEMORY_SPEED = 0.15           # m/s while recalling, slower than following because nobody is in view
+    MEMORY_PLAN_GRACE_SEC = 1.0   # wait this long for the first plan before giving up on the map and searching
+    SEARCH_SWEEP_SEC = 6.0        # sweep phase length before the full-circle scan starts
+    SEARCH_SCAN_SPEED = 0.80      # rad/s during the full-circle scan
+    SEARCH_MEMORY_SEC = 30.0      # how long the EKF keeps coasting the owner while searching
+    MIN_FOLLOW_DISTANCE = 0.60    # the dashboard cannot set the follow distance below this
     EKF_LEAD_SEC = 0.35           # steer toward where the person will be, not where they were
 
     # --- PID follow controller (tuned in tests/test_follow_sim.py) ---
-    PID_DIST_KP = 0.60
+    PID_DIST_KP = 0.45
     PID_DIST_KI = 0.04
-    PID_DIST_KD = 0.25
-    PID_TURN_KP = 1.50
-    PID_TURN_KI = 0.03
-    PID_TURN_KD = 0.30
+    PID_DIST_KD = 0.20
+    PID_TURN_KP = 2.20
+    PID_TURN_KI = 0.05
+    PID_TURN_KD = 0.35
     PID_FF_GAIN = 0.80            # feed-forward on the person's speed along the line of sight
     PID_MIN_V = 0.06
     STEERING_DEADZONE_DEG = 2.0
@@ -100,8 +110,8 @@ class Config:
     IDENTITY_MATCH_THRESHOLD = 0.40        # Minimum score to accept candidate as Owner when bystanders present
     IDENTITY_SINGLE_PERSON_THRESHOLD = 0.28 # Minimum score when only 1 candidate exists in FOV
     IDENTITY_AMBIGUITY_DELTA = 0.08        # Trigger TARGET_AMBIGUOUS if top two candidates differ by less than this
-    MAX_OWNER_TEMPLATES = 5                # Multi-view template bank size
-    TEMPLATE_UPDATE_MIN_CONF = 0.75        # Only add new template when identity match is very high
+    MAX_OWNER_TEMPLATES = 8                # Multi-view template bank size
+    TEMPLATE_UPDATE_MIN_CONF = 0.45        # Only add new template when identity match is very high
     TEMPLATE_DRIFT_ALPHA = 0.05            # Maximum EMA update rate to prevent template corruption
 
     # --- Gesture Recognition Parameters ---

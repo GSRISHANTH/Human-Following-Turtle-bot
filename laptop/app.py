@@ -15,13 +15,14 @@ import os
 import queue
 import threading
 import multiprocessing as mp
+import traceback
 from flask import Flask, render_template, Response, jsonify, request
 
 from config import Config
 from video_streamer import VideoStreamer
 from cv_worker import run_cv
 from lidar import LidarMap, sectors as lidar_sectors
-from navigation import Planner
+from navigation import Planner, PersonMemory, plan_with_memory
 import cv2
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -85,6 +86,7 @@ _TELEM_KEYS = (
 
 lidar_map = LidarMap()
 planner = Planner()
+person_memory = PersonMemory()
 latest_plan = None
 lidar_lock = threading.Lock()
 lidar_jpeg = None
@@ -108,13 +110,14 @@ def _feed_pose():
             seq, jpg = streamer.wait_new(last_seq, 0.25)
             if jpg is not None and seq != last_seq:
                 last_seq = seq
+                t_rx = streamer.last_frame_time
                 try:
                     if jpeg_q.full():
                         try:
                             jpeg_q.get_nowait()
                         except Exception:
                             pass
-                    jpeg_q.put_nowait(jpg)
+                    jpeg_q.put_nowait((jpg, t_rx))
                 except Exception:
                     pass
             now = time.time()
@@ -136,17 +139,23 @@ def _plan_loop():
         with telemetry_lock:
             person = latest_telemetry.get("person")
             enabled = latest_telemetry.get("following_enabled", True)
+            enrolled = latest_telemetry.get("owner_enrolled", False)
+        now = time.time()
         with lidar_lock:
-            fresh = lidar_map.pose is not None and time.time() - lidar_map.stamp < 1.0
-            if not fresh or not person or not enabled:
+            fresh = lidar_map.pose is not None and now - lidar_map.stamp < 1.0
+            if not enrolled:
+                person_memory.clear()
+            if not fresh or not enabled or not enrolled:
                 latest_plan = None
                 continue
-            plan = planner.plan(lidar_map.grid, lidar_map.origin, lidar_map.pose,
-                                (person["x"], person["y"]), Config.TARGET_DISTANCE)
+            plan = plan_with_memory(planner, lidar_map.grid, lidar_map.origin, lidar_map.pose, person,
+                                    person_memory, now, Config.TARGET_DISTANCE)
             latest_plan = plan
+        if plan is None:
+            continue
         try:
             cmd_q.put_nowait({"op": "plan", "wait": False, "plan": {
-                "blocked": plan["blocked"], "wp_bearing": plan["wp_bearing"], "status": plan["status"]}})
+                k: plan.get(k) for k in ("blocked", "wp_bearing", "status", "memory", "mem_bearing", "mem_range", "goal_dist", "age")}})
         except Exception:
             pass
 
@@ -156,7 +165,23 @@ def _feed_lidar():
     global lidar_jpeg, lidar_seq
     last = -1
     last_render = 0.0
+    last_error = 0.0
     while is_processing:
+        try:
+            last, last_render = _lidar_step(last, last_render)
+        except Exception:
+            # Never let the map thread die: a dead thread leaves the dashboard map blank for the rest of the session.
+            if time.time() - last_error > 5.0:
+                last_error = time.time()
+                traceback.print_exc()
+            with lidar_lock:
+                lidar_map.reset()
+            time.sleep(0.2)
+
+
+def _lidar_step(last, last_render):
+    global lidar_jpeg, lidar_seq
+    if True:
         count, scan = streamer.wait_scan(last, 0.25)
         now = time.time()
         if scan is not None and count != last:
@@ -188,7 +213,10 @@ def _feed_lidar():
                            "moving": sum(1 for l in lidar_map.labels if l == "moving")}
             with telemetry_cond:
                 latest_telemetry["localization"] = loc
-                latest_telemetry["plan_status"] = (latest_plan or {}).get("status", "--")
+                latest_telemetry["clearance"] = sec
+                lp = latest_plan or {}
+                latest_telemetry["plan_status"] = (("MEMORY " if lp.get("memory") else "") + lp.get("status", "--")) if lp else "--"
+                latest_telemetry["memory_age"] = round(lp["age"], 1) if lp.get("memory") else None
                 _bump()
             ok, buf = cv2.imencode(".jpg", view, [cv2.IMWRITE_JPEG_QUALITY, 80])
             if ok:
@@ -196,6 +224,7 @@ def _feed_lidar():
                     lidar_jpeg = buf.tobytes()
                     lidar_seq += 1
                     lidar_cond.notify_all()
+    return last, last_render
 
 
 def generate_lidar_stream():
@@ -243,13 +272,28 @@ def _start_cv():
 
 def _supervise_cv():
     """If the vision process ever dies, restart it. The Pi stops the wheels within 0.6 s meanwhile."""
+    started = time.time()
+    quick_failures = 0
     while is_processing:
         time.sleep(1.0)
         if cv_proc is not None and not cv_proc.is_alive():
-            print(f"[Dashboard] Vision process exited (code {cv_proc.exitcode}); restarting.")
-            with telemetry_cond:
-                latest_telemetry["status_message"] = "Vision process restarted"
-                _bump()
+            lived = time.time() - started
+            quick_failures = quick_failures + 1 if lived < 15.0 else 0
+            if quick_failures >= 3:
+                msg = (f"Vision process keeps failing at startup (exit code {cv_proc.exitcode}). "
+                       "See the [Vision] message above. Fix the install, then restart the dashboard.")
+                print(f"[Dashboard] {msg}")
+                with telemetry_cond:
+                    latest_telemetry["status_message"] = msg
+                    _bump()
+                time.sleep(30.0)
+                quick_failures = 2          # try again, but at most once every 30 s
+            else:
+                print(f"[Dashboard] Vision process exited (code {cv_proc.exitcode}); restarting.")
+                with telemetry_cond:
+                    latest_telemetry["status_message"] = "Vision process restarted"
+                    _bump()
+            started = time.time()
             _start_cv()
 
 
@@ -484,7 +528,7 @@ def api_config():
 
         if "target_distance" in req_data:
             try:
-                Config.TARGET_DISTANCE = float(req_data["target_distance"])
+                Config.TARGET_DISTANCE = max(Config.MIN_FOLLOW_DISTANCE, min(3.5, float(req_data["target_distance"])))
                 _cv_call("target_distance", value=Config.TARGET_DISTANCE)
             except ValueError:
                 pass

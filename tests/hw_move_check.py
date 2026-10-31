@@ -170,6 +170,46 @@ if front() > 1.0:
 else:
     print("  skipped: not enough room")
 
+def all_round():
+    r = lidar.to_meters(state["bins"])
+    m = np.isfinite(r)
+    return float(r[m].min()) if m.any() else 9.9
+
+
+print("\n[fast spin] 1.5 rad/s for 1.0 s")
+if all_round() > 0.4:
+    results["fast"] = run("fast spin left", 0.0, 1.5, 1.0, None, "about +86 deg")
+else:
+    print("  skipped: something within 0.4 m")
+
+print("\n[360 scan] the search scan: turn at 0.8 rad/s until odometry says a full circle")
+if all_round() > 0.4:
+    pump()
+    start = state["pose"][2]
+    total, prev, t0 = 0.0, start, time.time()
+    while total < 2 * math.pi and time.time() - t0 < 20.0:
+        pump()
+        send(0.0, 0.8)
+        y = state["pose"][2]
+        total += (y - prev + math.pi) % (2 * math.pi) - math.pi
+        prev = y
+        time.sleep(1 / 30)
+    t_cmd = time.time() - t0
+    stop(1.5)
+    pump()
+    y = state["pose"][2]
+    total += (y - prev + math.pi) % (2 * math.pi) - math.pi
+    print(f"  commanded until {math.degrees(total):.0f} deg had passed: {t_cmd:.1f} s (ideal {2 * math.pi / 0.8:.1f} s); "
+          f"after stopping it had turned {math.degrees(total):.0f} deg in all")
+    results["scan360"] = (True, 0.0, math.degrees(total), 0.0)
+else:
+    print("  skipped: something within 0.4 m")
+
+if front() > 1.2:
+    results["fast_fwd"] = run("forward 0.20 m/s", 0.20, 0.0, 1.5, front, "about 0.30 m")
+else:
+    print("\n[forward 0.20] skipped: need 1.2 m clear ahead")
+
 stop(1.0)
 if "left" in results and "right" in results:
     l, r = results["left"][2], results["right"][2]

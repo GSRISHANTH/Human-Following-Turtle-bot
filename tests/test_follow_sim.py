@@ -19,7 +19,7 @@ from ekf_person import PersonEKF  # noqa: E402
 from follow_controller import FollowController  # noqa: E402
 
 
-def simulate(person_path, seconds=40.0, seed=3, start_range=1.6, lidar=True):
+def simulate(person_path, seconds=40.0, seed=3, start_range=1.6, lidar=True, cam_dropout=None, all_dropout=None):
     rnd = random.Random(seed)
     dt = 1.0 / 30.0
     rx = ry = rth = 0.0
@@ -42,12 +42,16 @@ def simulate(person_path, seconds=40.0, seed=3, start_range=1.6, lidar=True):
         c, s = math.cos(-rth), math.sin(-rth)
         lx, ly = c * dx - s * dy, s * dx + c * dy
         r_true, b_true = math.hypot(lx, ly), math.atan2(ly, lx)
+        blackout = all_dropout is not None and all_dropout[0] <= t < all_dropout[1]
+        cam_out = blackout or (cam_dropout is not None and cam_dropout[0] <= t < cam_dropout[1])
         if t >= next_cam:
             next_cam += 1 / 12.0
-            meas_q.append((t + 0.15, "cam", r_true + rnd.gauss(0, 0.12 * r_true), b_true + rnd.gauss(0, math.radians(1.5))))
+            if not cam_out:
+                    meas_q.append((t + 0.15, "cam", r_true + rnd.gauss(0, 0.12 * r_true), b_true + rnd.gauss(0, math.radians(1.5))))
         if lidar and t >= next_lidar:
             next_lidar += 0.1
-            meas_q.append((t + 0.05, "lidar", r_true + rnd.gauss(0, 0.05), b_true + rnd.gauss(0, math.radians(1.0))))
+            if not blackout:
+                    meas_q.append((t + 0.05, "lidar", r_true + rnd.gauss(0, 0.05), b_true + rnd.gauss(0, math.radians(1.0))))
         while meas_q and meas_q[0][0] <= t:
             _, kind, r_m, b_m = meas_q.popleft()
             if not ekf.active:
@@ -67,14 +71,24 @@ def simulate(person_path, seconds=40.0, seed=3, start_range=1.6, lidar=True):
             applied_v, applied_w = cv_, cw_
             tgt_v, tgt_w = applied_v, applied_w
         dv, dw = tgt_v - v, tgt_w - w
-        v += max(-0.9 * dt, min(0.9 * dt, dv))
-        w += max(-3.6 * dt, min(3.6 * dt, dw))
+        v += max(-Config.MAX_ACCEL_LINEAR * dt, min(Config.MAX_ACCEL_LINEAR * dt, dv))
+        w += max(-Config.MAX_ACCEL_ANGULAR * dt, min(Config.MAX_ACCEL_ANGULAR * dt, dw))
         rx += v * math.cos(rth) * dt
         ry += v * math.sin(rth) * dt
         rth += w * dt
         log.append((t, r_true, b_true, v, w))
         t += dt
     return log
+
+
+def sharp_turn(t):
+    """Walks straight, then turns 90 degrees to the left in 2 s, then straight again."""
+    if t < 8:
+        return 0.18, 0.0
+    if t < 10:
+        a = (t - 8) / 2.0 * (math.pi / 2)
+        return 0.18 * math.cos(a), 0.18 * math.sin(a)
+    return 0.0, 0.18
 
 
 def straight_then_turn(t):
@@ -115,6 +129,28 @@ class FollowSim(unittest.TestCase):
         walking = [l for l in log if 6.0 <= l[0] <= 22.0]
         rms = math.sqrt(sum((l[1] - Config.DESIRED_DISTANCE) ** 2 for l in walking) / len(walking))
         self.assertLess(rms, 0.35)
+
+    def test_sharp_turn_stays_in_view_and_recovers(self):
+        log = simulate(sharp_turn, seconds=25.0)
+        turn = [l for l in log if 8.0 <= l[0] <= 14.0]
+        self.assertLess(max(abs(math.degrees(l[2])) for l in turn), 35.0)
+        settled = [l for l in log if 18.0 <= l[0] <= 25.0]
+        self.assertLess(max(abs(math.degrees(l[2])) for l in settled), 12.0)
+        self.assertLessEqual(max(abs(l[4]) for l in log), Config.MAX_ANGULAR_VEL + 1e-6)
+
+    def test_camera_dropout_with_lidar_keeps_following(self):
+        """Close-range case: the camera loses the person for 5 s, the LiDAR does not."""
+        log = simulate(straight_then_turn, cam_dropout=(8.0, 13.0))
+        during = [l for l in log if 9.0 <= l[0] <= 13.0]
+        self.assertLess(max(abs(l[1] - Config.DESIRED_DISTANCE) for l in during), 0.45)
+        self.assertLess(max(abs(math.degrees(l[2])) for l in during), 15.0)
+
+    def test_total_blackout_coasts_without_running_away(self):
+        """Neither sensor for 1.5 s: the EKF coasts, the robot keeps heading roughly right and does not close in."""
+        log = simulate(straight_then_turn, all_dropout=(8.0, 9.5))
+        during = [l for l in log if 8.0 <= l[0] <= 10.5]
+        self.assertGreater(min(l[1] for l in during), 0.9)
+        self.assertLess(max(abs(math.degrees(l[2])) for l in during), 20.0)
 
     def test_ekf_estimates_person_velocity(self):
         log = simulate(lambda t: (0.18, 0.0), seconds=15.0)

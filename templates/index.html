@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/css/style.css?v=5">
+    <link rel="stylesheet" href="/static/css/style.css?v=7">
 </head>
 <body>
     {% if hil %}
@@ -229,6 +229,13 @@
                     </div>
                 </div>
 
+                <div class="follow-dist">
+                    <label for="follow-dist">FOLLOW DISTANCE</label>
+                    <input type="range" id="follow-dist" min="0.6" max="3.0" step="0.05" value="1.2">
+                    <span id="follow-dist-val">1.20 m</span>
+                </div>
+                <p class="card-hint" style="margin-top:6px">The robot stops and waits at this distance and resumes when you walk away. It never goes closer than 0.6 m.</p>
+
                 <!-- Horizon Steering Balance Bar -->
                 <div class="horizon-wrapper">
                     <div class="horizon-labels">
@@ -321,6 +328,6 @@
         </section>
     </div>
 
-    <script src="/static/js/dashboard.js?v=5"></script>
+    <script src="/static/js/dashboard.js?v=7"></script>
 </body>
 </html>

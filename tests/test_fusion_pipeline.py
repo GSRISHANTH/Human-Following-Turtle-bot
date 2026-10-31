@@ -61,7 +61,7 @@ class FusionPipeline(unittest.TestCase):
         for i in range(10):
             p.set_lidar(bins_with({25: 1.9}))
             r, b, f_px = p._fuse(cand, W, now + i * 0.07)
-            v, w, status = p._follow_command(cand, b, r, f_px, r, {"front": 3, "left": 3, "right": 3}, now + i * 0.07)
+            v, w, status = p._follow_command(b, r, 0.15, {"front": 3, "left": 3, "right": 3}, now + i * 0.07)
         self.assertGreater(w, 0.0)  # person on the left -> turn left (+w)
         self.assertLessEqual(v, Config.MAX_LINEAR_VEL)
         self.assertEqual(status, "LIDAR_CLEAR")
@@ -73,13 +73,13 @@ class FusionPipeline(unittest.TestCase):
         for i in range(10):
             p.set_lidar(bins_with({0: 1.8}))  # only the person ahead
             r, b, f_px = p._fuse(cand, W, now + i * 0.07)
-            v, w, status = p._follow_command(cand, b, r, f_px, r, {"front": 3, "left": 3, "right": 3}, now + i * 0.07)
+            v, w, status = p._follow_command(b, r, 0.15, {"front": 3, "left": 3, "right": 3}, now + i * 0.07)
         self.assertEqual(status, "LIDAR_CLEAR")
         self.assertGreater(v, 0.0)
         for i in range(10, 14):
             p.set_lidar(bins_with({0: 1.8, 12: 0.25}))  # box right in the way, off to one side of the person
             r, b, f_px = p._fuse(cand, W, now + i * 0.07)
-            v, w, status = p._follow_command(cand, b, r, f_px, r, {"front": 3, "left": 3, "right": 3}, now + i * 0.07)
+            v, w, status = p._follow_command(b, r, 0.15, {"front": 3, "left": 3, "right": 3}, now + i * 0.07)
         self.assertEqual(status, "LIDAR_STOP")
         self.assertEqual(v, 0.0)
 

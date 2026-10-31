@@ -138,7 +138,12 @@ class EndToEnd(unittest.TestCase):
         self.assertFalse(self.streamer.pi_status["motors"])
 
         from robot_controller import RobotController
-        rc = RobotController()
+        from config import Config
+        Config.COMMAND_MODE = "udp"            # this one test really sends, to the Pi node it started on loopback
+        try:
+            rc = RobotController()
+        finally:
+            Config.COMMAND_MODE = "mock"
         rc.set_mode("MANUAL")
         rc.update_manual_teleop(0.1, 0.0)
         time.sleep(1.0)

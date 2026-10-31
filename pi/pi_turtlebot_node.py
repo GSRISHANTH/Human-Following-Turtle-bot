@@ -50,7 +50,7 @@ JPEG_QUALITY = 50
 CMD_TIMEOUT = 0.35  # about ten missed packets at 30 Hz
 PEER_TIMEOUT = 3.0
 MAX_LINEAR = 0.22   # TurtleBot3 Burger limits
-MAX_ANGULAR = 1.40
+MAX_ANGULAR = 2.20
 
 ROS_MODE = None  # 'ROS1', 'ROS2', or None
 ros_cmd_pub = None
@@ -142,8 +142,11 @@ def _odom_cb(msg):
     import math
     q = msg.pose.pose.orientation
     yaw = math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
+    pose = (msg.pose.pose.position.x, msg.pose.pose.position.y, yaw)
+    if not all(math.isfinite(v) for v in pose):
+        return
     with scan_lock:
-        odom_pose = (msg.pose.pose.position.x, msg.pose.pose.position.y, yaw)
+        odom_pose = pose
 
 
 if ROS_MODE == 'ROS2':
@@ -156,6 +159,35 @@ if ROS_MODE == 'ROS2':
         print("[Pi] Subscribed to /scan and /odom")
     except Exception as e:
         print(f"[Pi] LiDAR subscriptions failed: {e}")
+
+torque_on = False
+
+
+def _enable_torque():
+    """OpenCR starts with motor torque off. Ask for it until the driver confirms, so a restart can never leave the
+    wheels limp (start_robot.sh's one-shot call can race the driver). Not called with --no-motors."""
+    global torque_on
+    try:
+        from std_srvs.srv import SetBool
+        cli = ros2_node.create_client(SetBool, '/motor_power')
+        while not torque_on:
+            if not cli.wait_for_service(timeout_sec=2.0):
+                continue
+            fut = cli.call_async(SetBool.Request(data=True))
+            t0 = time.monotonic()
+            while not fut.done() and time.monotonic() - t0 < 3.0:
+                time.sleep(0.05)
+            if fut.done() and fut.result() is not None and fut.result().success:
+                torque_on = True
+                print("[Pi] Motor torque enabled.")
+            else:
+                time.sleep(1.0)
+    except Exception as e:
+        print(f"[Pi] Could not enable motor torque: {e}")
+
+
+if ROS_MODE == 'ROS2' and not NO_MOTORS:
+    threading.Thread(target=_enable_torque, daemon=True).start()
 
 if NO_MOTORS:
     print("[Pi] --no-motors: /cmd_vel and OpenCR serial are never written.")
@@ -415,7 +447,7 @@ def sender_loop(camera):
                 lin, ang = cur_lin, cur_ang
             status = {
                 "ros": ROS_MODE, "subs": subs, "serial": SERIAL_ENABLED,
-                "motors": not NO_MOTORS, "camera": camera.cap is not None,
+                "motors": not NO_MOTORS, "torque": torque_on, "camera": camera.cap is not None,
                 "cam_fps": round(camera.capture_fps, 1), "send_fps": round(send_fps, 1),
                 "raw": camera.raw, "cmd_age": None if cmd_age is None else round(cmd_age, 2),
                 "cmds": cmd_count, "lin": lin, "ang": ang,

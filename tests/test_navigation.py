@@ -139,22 +139,43 @@ class ReIdGate(unittest.TestCase):
             p.ekf.predict((i + 1) * 0.08)
             p.ekf.update(2.0, 0.0, 0.05, math.radians(1.0))
 
+    def lose(self, ago=0.5):
+        p = self.pipe
+        p.target_lost_time = 1000.0
+        p.target_state = self.cfg.STATE_SEARCHING
+        return 1000.0 + ago
+
     def test_stranger_after_owner_left_is_rejected(self):
         p = self.pipe
         self.track()
-        p.target_lost_time = 1.0       # the owner left the view
-        p.target_state = self.cfg.STATE_SEARCHING
-        results = [p._accept_owner(self.cand(0.42), 0.6, 1, 10.0 + i, 480) for i in range(30)]
-        self.assertFalse(any(results), "someone who scores 0.42 must never inherit the lock")
+        t = self.lose()
+        results = [p._accept_owner(self.cand(0.28), 0.5, 1, t + i * 0.08, 480) for i in range(40)]
+        self.assertFalse(any(results), "someone who looks nothing like the owner must never inherit the lock")
 
-    def test_owner_returning_is_accepted_after_confirmation(self):
+    def test_owner_returning_is_accepted_after_a_short_confirmation(self):
         p = self.pipe
         self.track()
-        p.target_lost_time = 1.0
-        p.target_state = self.cfg.STATE_SEARCHING
-        results = [p._accept_owner(self.cand(0.66, 200), 0.7, 1, 10.0 + i, 480) for i in range(12)]
+        t = self.lose()
+        results = [p._accept_owner(self.cand(0.52, 200), 0.6, 1, t + i * 0.08, 480) for i in range(8)]
         self.assertFalse(results[0])
+        self.assertTrue(results[2], "near where the owner was heading, 3 frames are enough")
+
+    def test_far_from_where_the_owner_was_heading_needs_more_evidence(self):
+        p = self.pipe
+        self.track()
+        t = self.lose(0.0)
+        # candidate at the frame edge, ~+28 degrees from the EKF, shortly after the loss: no relaxation
+        results = [p._accept_owner(self.cand(0.45, 5), 0.5, 1, t + i * 0.08, 480) for i in range(8)]
+        self.assertFalse(results[2], "3 frames are only enough near the predicted position")
         self.assertTrue(results[self.cfg.REACQ_CONFIRM_FRAMES - 1])
+
+    def test_lidar_alive_means_the_track_is_not_lost(self):
+        p = self.pipe
+        self.track()
+        self.lose()
+        # the owner is invisible to the camera but the LiDAR still has them: a lookalike elsewhere is rejected
+        self.assertFalse(p._accept_owner(self.cand(0.9, 20), 0.9, 2, 1001.0, 480, lidar_alive=True))
+        self.assertTrue(p._accept_owner(self.cand(0.5, 245), 0.6, 2, 1001.1, 480, lidar_alive=True))
 
     def test_confirmation_resets_if_candidate_jumps_or_score_dips(self):
         p = self.pipe
@@ -189,3 +210,104 @@ class ReIdGate(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Memory(unittest.TestCase):
+    from navigation import PersonMemory, plan_with_memory  # noqa: E402
+
+    @staticmethod
+    def person(x, y, vx=0.0, vy=0.0, misses=0):
+        return {"x": x, "y": y, "vx": vx, "vy": vy, "misses": misses}
+
+    def test_remembers_in_the_map_frame_and_ignores_unmeasured_coasting(self):
+        from navigation import PersonMemory
+        mem = PersonMemory()
+        mem.update(self.person(2.0, 0.0), (1.0, 1.0, math.pi / 2), 10.0)       # robot faces +y, person 2 m ahead
+        self.assertAlmostEqual(mem.pos[0], 1.0, places=3)
+        self.assertAlmostEqual(mem.pos[1], 3.0, places=3)
+        mem.update(self.person(9.0, 9.0, misses=5), (1.0, 1.0, 0.0), 11.0)      # coasting EKF: not trusted
+        self.assertAlmostEqual(mem.pos[1], 3.0, places=3)
+
+    def test_extrapolation_decays_and_is_capped(self):
+        from navigation import PersonMemory, MAX_EXTRAP_M
+        mem = PersonMemory()
+        mem.update(self.person(2.0, 0.0, vx=0.5), (0.0, 0.0, 0.0), 0.0)
+        near = mem.estimate(1.0)[0] - 2.0
+        far = mem.estimate(10.0)[0] - 2.0
+        self.assertGreater(near, 0.0)
+        self.assertGreater(far, near)
+        self.assertLessEqual(far, MAX_EXTRAP_M + 1e-6)
+        fast = PersonMemory()
+        fast.update(self.person(2.0, 0.0, vx=2.0), (0.0, 0.0, 0.0), 0.0)
+        self.assertLessEqual(fast.estimate(30.0)[0] - 2.0, MAX_EXTRAP_M + 1e-6)
+
+    def test_expires(self):
+        from navigation import PersonMemory, MEMORY_SEC
+        mem = PersonMemory()
+        mem.update(self.person(2.0, 0.0), (0.0, 0.0, 0.0), 0.0)
+        self.assertTrue(mem.valid(MEMORY_SEC - 1))
+        self.assertFalse(mem.valid(MEMORY_SEC + 1))
+
+    def _scene(self):
+        m = lidar.LidarMap()
+        wall = [(0.4, -1.8, 0.5, 0.45)]          # wall across the room with the only gap on the left
+        for _ in range(40):
+            m.update(room_scan((0.0, 0.0, 0.0), wall), (0.0, 0.0, 0.0))
+        return m
+
+    def test_hidden_owner_behind_an_obstacle_is_planned_to_round_it(self):
+        from navigation import PersonMemory, plan_with_memory
+        m = self._scene()
+        mem = PersonMemory()
+        pl = Planner()
+        # tracked just before they walked behind the wall, then no longer measured
+        first = plan_with_memory(pl, m.grid, m.origin, m.pose, self.person(2.0, -0.5), mem, 0.0, 1.2)
+        self.assertFalse(first["memory"])
+        lost = plan_with_memory(pl, m.grid, m.origin, m.pose, None, mem, 3.0, 1.2)
+        self.assertTrue(lost["memory"])
+        self.assertEqual(lost["status"], "DETOUR")
+        self.assertGreater(lost["wp_bearing"], 0.1, "toward the gap")
+        self.assertGreater(lost["goal_dist"], 0.3)
+        self.assertGreater(lost["age"], 2.9)
+
+    def test_memory_stays_put_in_the_map_while_the_robot_moves(self):
+        from navigation import PersonMemory, plan_with_memory
+        m = self._scene()
+        mem = PersonMemory()
+        pl = Planner()
+        plan_with_memory(pl, m.grid, m.origin, m.pose, self.person(2.0, 0.0), mem, 0.0, 1.2)
+        world = tuple(mem.pos)
+        moved = (0.0, 0.9, math.radians(40))                       # the robot drove round and turned
+        plan = plan_with_memory(pl, m.grid, m.origin, moved, None, mem, 2.0, 1.2)
+        self.assertEqual(tuple(mem.pos), world)
+        # in the new robot frame the remembered spot is where the map says it is
+        c, s = math.cos(-moved[2]), math.sin(-moved[2])
+        dx, dy = world[0] - moved[0], world[1] - moved[1]
+        self.assertAlmostEqual(plan["mem_bearing"], math.atan2(s * dx + c * dy, c * dx - s * dy), places=2)
+
+    def test_nothing_to_go_to_when_never_seen_or_too_old(self):
+        from navigation import PersonMemory, plan_with_memory, MEMORY_SEC
+        m = self._scene()
+        mem = PersonMemory()
+        self.assertIsNone(plan_with_memory(Planner(), m.grid, m.origin, m.pose, None, mem, 0.0, 1.2))
+        mem.update(self.person(2.0, 0.0), m.pose, 0.0)
+        self.assertIsNone(plan_with_memory(Planner(), m.grid, m.origin, m.pose, None, mem, MEMORY_SEC + 1, 1.2))
+
+    def test_replans_when_an_obstacle_appears_and_when_it_goes(self):
+        from navigation import PersonMemory, plan_with_memory
+        clear = lidar.LidarMap()
+        for _ in range(40):
+            clear.update(room_scan((0.0, 0.0, 0.0)), (0.0, 0.0, 0.0))
+        mem = PersonMemory()
+        pl = Planner()
+        a = plan_with_memory(pl, clear.grid, clear.origin, clear.pose, self.person(2.0, 0.0), mem, 0.0, 1.2)
+        self.assertEqual(a["status"], "DIRECT")
+        for _ in range(40):                                        # a box is put between the robot and the spot
+            clear.update(room_scan((0.0, 0.0, 0.0), [(0.3, -0.3, 0.55, 0.3)]), (0.0, 0.0, 0.0))
+        b = plan_with_memory(pl, clear.grid, clear.origin, clear.pose, None, mem, 1.0, 1.2)
+        self.assertTrue(b["memory"])
+        self.assertEqual(b["status"], "DETOUR", "must replan round the new box")
+        for _ in range(60):                                        # and it is taken away again
+            clear.update(room_scan((0.0, 0.0, 0.0)), (0.0, 0.0, 0.0))
+        c = plan_with_memory(pl, clear.grid, clear.origin, clear.pose, None, mem, 2.0, 1.2)
+        self.assertEqual(c["status"], "DIRECT")

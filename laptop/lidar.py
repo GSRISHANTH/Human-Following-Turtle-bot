@@ -71,7 +71,27 @@ def segment(ranges, max_range=6.0):
             "width": float(math.hypot(x.max() - x.min(), y.max() - y.min())),
             "range": math.hypot(cx, cy), "bearing": math.atan2(cy, cx), "n": len(idx),
         })
-    return out
+    return _merge_legs(out)
+
+
+def _merge_legs(clusters):
+    """Two legs are two clusters a few centimetres apart. Merge neighbours that together are still person-sized."""
+    merged = []
+    for c in clusters:
+        if merged:
+            p = merged[-1]
+            if math.hypot(c["cx"] - p["cx"], c["cy"] - p["cy"]) < 0.40:
+                x = np.concatenate([p["x"], c["x"]])
+                y = np.concatenate([p["y"], c["y"]])
+                width = math.hypot(x.max() - x.min(), y.max() - y.min())
+                if width <= PERSON_WIDTH[1]:
+                    cx, cy = float(x.mean()), float(y.mean())
+                    merged[-1] = {"idx": np.concatenate([p["idx"], c["idx"]]), "x": x, "y": y, "cx": cx, "cy": cy,
+                                  "width": width, "range": math.hypot(cx, cy), "bearing": math.atan2(cy, cx),
+                                  "n": len(x)}
+                    continue
+        merged.append(c)
+    return merged
 
 
 def person_cluster(clusters, bearing, near, window_deg=9.0):
@@ -177,6 +197,7 @@ class LidarMap:
         self.scans = 0
         self.loc_score = 0.0
         self.loc_shift = 0.0              # metres of correction applied so far
+        self.resets = 0                   # odometry restarts detected
         self.trail = []
         self.clusters = []
         self.labels = []
@@ -256,6 +277,16 @@ class LidarMap:
             self.hz = 1.0 / max(self.dt_avg, 1e-3)
         self.stamp = now
         self.bins = to_meters(bins_mm)
+        if odom is not None and not all(math.isfinite(v) for v in odom):
+            odom = None                      # a NaN here would poison the pose, the trail and every later render
+        prev = self.pose_odom
+        if odom is not None and prev is not None:
+            jump = math.hypot(odom[0] - prev[0], odom[1] - prev[1])
+            if jump > 0.6 or abs(wrap(odom[2] - prev[2])) > math.radians(70):
+                # The robot cannot do that between two scans: odometry restarted (Pi or driver rebooted).
+                # The old map is in a different frame, so start a new one instead of smearing both together.
+                self.reset()
+                self.resets += 1
         self.pose_odom = odom
         n = len(self.bins)
         ang_r = bin_angles(n)
@@ -315,7 +346,7 @@ class LidarMap:
     def _integrate(self, pose, ang_r, hit):
         n = len(self.bins)
         yaw_ang = ang_r + pose[2]
-        r_free = np.where(hit, self.bins - self.RES, 3.0)
+        r_free = np.where(hit, np.maximum(self.bins - 0.10, 0.0), 3.0)   # stop short of the surface so grazing beams do not erase it
         fx, fy = pose[0] + np.cos(yaw_ang) * r_free, pose[1] + np.sin(yaw_ang) * r_free
         gx, gy = self._cell(fx, fy)
         rx, ry = self._cell(pose[0], pose[1])
@@ -329,10 +360,19 @@ class LidarMap:
         occ = np.zeros((self.N, self.N), dtype=np.uint8)
         pts = [(int(hgx[i]), int(hgy[i])) for i in range(n) if hit[i]]
         # join neighbouring returns on one surface so walls are solid instead of dotted
-        for i in range(n):
-            j = (i + 1) % n
-            if hit[i] and hit[j] and abs(self.bins[i] - self.bins[j]) < max(0.08, 0.05 * self.bins[i]):
-                cv2.line(occ, (int(hgx[i]), int(hgy[i])), (int(hgx[j]), int(hgy[j])), 1, 1)
+        # (the LDS-02 drops returns at range, so bridge up to 4 missing beams when the surface is clearly continuous)
+        idx = np.nonzero(hit)[0]
+        for a_i, i in enumerate(idx):
+            for k in range(1, 6):
+                if a_i + k >= len(idx):
+                    break
+                j = idx[a_i + k]
+                gap = j - i
+                if gap > 5:
+                    break
+                if abs(self.bins[i] - self.bins[j]) < max(0.08, 0.06 * self.bins[i]) * (1 + 0.5 * (gap - 1)):
+                    cv2.line(occ, (int(hgx[i]), int(hgy[i])), (int(hgx[j]), int(hgy[j])), 1, 1)
+                    break
         for x, y in pts:
             if 0 <= x < self.N and 0 <= y < self.N:
                 occ[y, x] = 1
@@ -351,7 +391,7 @@ class LidarMap:
             img = np.empty((self.N, self.N, 3), dtype=np.uint8)
             img[:] = C_BG
             img[cv2.blur(self.grid, (3, 3)) < -0.3] = C_FREE
-            wall = cv2.dilate((self.grid > 1.2).astype(np.uint8), np.ones((2, 2), np.uint8)) > 0
+            wall = cv2.dilate((self.grid > 0.9).astype(np.uint8), np.ones((2, 2), np.uint8)) > 0
             img[wall] = C_WALL
 
             def gpx(wx, wy):
@@ -392,6 +432,17 @@ class LidarMap:
                 g = to_view(*self.world_to_robot(*plan["goal"]))
                 cv2.drawMarker(view, g, (255, 120, 255), cv2.MARKER_DIAMOND, 12, 2, cv2.LINE_AA)
 
+        # where the owner was last seen, remembered in the map while the camera cannot see them
+        if plan and plan.get("memory") and plan.get("mem_world") and self.pose is not None:
+            mx, my = to_view(*self.world_to_robot(*plan["mem_world"]))
+            ov = view.copy()
+            cv2.line(ov, (int(cx), int(cy)), (mx, my), (255, 120, 255), 1, cv2.LINE_AA)
+            view = cv2.addWeighted(ov, 0.5, view, 0.5, 0)
+            cv2.drawMarker(view, (mx, my), (80, 230, 70), cv2.MARKER_TILTED_CROSS, 18, 2, cv2.LINE_AA)
+            cv2.circle(view, (mx, my), int(0.3 * S), (80, 230, 70), 1, cv2.LINE_AA)
+            cv2.putText(view, f"LAST SEEN {plan.get('age', 0):.0f}s ago", (mx + 12, my + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                        (80, 230, 70), 1, cv2.LINE_AA)
+
         # current scan, coloured by what the cluster is
         person_xy = (person["x"], person["y"]) if person else None
         if self.bins is not None:
@@ -412,8 +463,13 @@ class LidarMap:
                     cv2.putText(view, "MOVING", (p[0] + 8, p[1] - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.36, C_MOVING, 1, cv2.LINE_AA)
 
         if len(self.trail) > 1 and self.pose is not None:
-            tp = [to_view(*self.world_to_robot(x, y)) for x, y in self.trail[-120:]]
-            cv2.polylines(view, [np.array(tp, dtype=np.int32)], False, (200, 200, 120), 1, cv2.LINE_AA)
+            try:
+                tp = [to_view(*self.world_to_robot(x, y)) for x, y in self.trail[-120:]
+                      if math.isfinite(x) and math.isfinite(y)]
+                if len(tp) > 1:
+                    cv2.polylines(view, [np.array(tp, dtype=np.int32)], False, (200, 200, 120), 1, cv2.LINE_AA)
+            except (ValueError, OverflowError):
+                self.trail = []
 
         cv2.circle(view, (int(cx), int(cy)), max(4, int(0.105 * S)), (255, 240, 120), 2, cv2.LINE_AA)
         cv2.line(view, (int(cx), int(cy)), (int(cx), int(cy - 0.16 * S)), (255, 240, 120), 2, cv2.LINE_AA)

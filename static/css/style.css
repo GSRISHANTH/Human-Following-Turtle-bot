@@ -218,6 +218,12 @@ body {
     }
 }
 
+/* Follow distance */
+.follow-dist { display: grid; grid-template-columns: auto 1fr auto; gap: 10px; align-items: center; margin-top: 14px; }
+.follow-dist label { font-size: 0.68rem; letter-spacing: 0.1em; color: var(--text-muted); }
+.follow-dist input { accent-color: var(--neon-cyan); width: 100%; }
+.follow-dist span { font-family: var(--font-mono); font-weight: 600; min-width: 3.6em; text-align: right; }
+
 /* Re-ID readout */
 .reid-detail { font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-secondary); margin: 10px 0 6px; }
 .reid-bar { position: relative; height: 8px; background: rgba(0,0,0,0.35); border-radius: 4px; margin-bottom: 14px; }

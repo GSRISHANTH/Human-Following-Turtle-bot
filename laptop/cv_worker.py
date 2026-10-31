@@ -8,6 +8,7 @@ import traceback
 
 
 def _apply(engine, cmd):
+    from config import Config
     op = cmd.get("op")
     ok = True
     if op == "unlock":
@@ -32,7 +33,7 @@ def _apply(engine, cmd):
     elif op == "calibration":
         engine.distance_calibration = float(cmd["value"])
     elif op == "target_distance":
-        engine.base_target_distance = float(cmd["value"])
+        engine.base_target_distance = max(Config.MIN_FOLLOW_DISTANCE, min(3.5, float(cmd["value"])))
     elif op == "lidar":
         engine.set_lidar(cmd["bins"])
     elif op == "plan":
@@ -82,9 +83,15 @@ def _publish(out_q, item):
 
 def run_cv(jpeg_q, out_q, cmd_q, reply_q):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    import cv2
-    import numpy as np
-    from cv_pipeline import CVPipeline
+    try:
+        import cv2
+        import numpy as np
+        from cv_pipeline import CVPipeline
+        from config import Config
+    except ImportError as exc:
+        print(f"[Vision] Cannot start: {exc}. This Python ({sys.executable}) is missing a package; "
+              "use `py -3.11 app.py` or `pip install mediapipe opencv-python numpy`.", flush=True)
+        sys.exit(3)
 
     engine = CVPipeline()
     pose_count = 0
@@ -94,6 +101,7 @@ def run_cv(jpeg_q, out_q, cmd_q, reply_q):
 
     while True:
         _drain_commands(engine, cmd_q, reply_q)
+        t_frame = None
         try:
             jpeg = jpeg_q.get(timeout=0.05)
         except queue.Empty:
@@ -115,6 +123,7 @@ def run_cv(jpeg_q, out_q, cmd_q, reply_q):
 
         if jpeg is None:
             break
+        jpeg, t_frame = jpeg
 
         _drain_commands(engine, cmd_q, reply_q)
         frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
@@ -122,7 +131,7 @@ def run_cv(jpeg_q, out_q, cmd_q, reply_q):
             continue
 
         try:
-            tel, _annotated = engine.process_frame(frame)
+            tel, _annotated = engine.process_frame(frame, t_frame)
         except Exception:
             # One bad frame must not kill the process: video, commands and the UI all depend on it.
             engine.robot.update_auto_commands(0.0, 0.0, can_move=False)

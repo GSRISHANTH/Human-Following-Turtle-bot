@@ -339,3 +339,21 @@ python test_system.py
 - **LiDAR at 1 degree**, clustered into objects. The camera's person is matched to a person-sized cluster and that cluster's centroid is the LiDAR measurement fed to the EKF. On the map, the person is green, objects that appeared in space seen free before are `MOVING`, and everything else is a static obstacle or wall.
 - **Localisation**: `LidarMap` scan-matches each scan against the map built so far (correlative matching over +/-10 cm and +/-4 degrees, damped) and keeps an odom-to-map correction, so wheel-odometry drift is corrected instead of smearing the map.
 - **Path planning** (`laptop/navigation.py`): A* on the inflated occupancy grid to a goal `TARGET_DISTANCE` short of the person. If the straight line is clear the robot drives at the person; if not, it steers at a waypoint 0.6 m along the path (`DETOUR`), and stops with `NO_PATH` if none exists. The path is drawn in magenta on the map.
+
+### Close range, lost-person search, speeds
+
+- **Close range**: when you are too close for the low camera to see more than your legs, the person-sized LiDAR cluster at the EKF's expected position keeps the track alive (status `OWNER (LIDAR)`, up to `LIDAR_TRACK_MAX_SEC`). The robot stops and waits at the follow distance and resumes when you walk 15 cm beyond it, instead of searching. The distance is set with the dashboard slider (floor `MIN_FOLLOW_DISTANCE`, 0.6 m).
+- **Lost for real**: the EKF coasts your last position and velocity (velocity decays), the robot turns toward where you were heading, then sweeps wider around that direction for `SEARCH_MAX_DURATION_SEC`, using LiDAR to avoid rotating into something.
+- **Re-ID**: while the track is alive, position continuity decides and your appearance from any side is learned (only when you are alone in the picture). After a loss, appearance must clear `max(REACQ_THRESHOLD, 0.6 x your usual score)` for a few frames, fewer and easier near where you were heading.
+- **Calibration**: the camera's distance scale and its bearing offset are estimated against the LiDAR while both see you. Frames are timestamped on arrival and the EKF is advanced to the present before control (about 100 ms of latency).
+- **Speeds**: forward is capped at 0.22 m/s, the Burger's hardware limit. Turning is up to 2.0 rad/s (hardware 2.84), accelerations 1.6 m/s^2 and 8 rad/s^2.
+- **Hardware movement check**: `python tests/hw_move_check.py` (dashboard stopped) drives a few centimetres and compares odometry with the LiDAR.
+- **Power**: if the Pi reboots or the LiDAR's USB drops when the motors run, check the battery and the Pi's 5 V supply. The Pi node enables motor torque itself and retries until the driver confirms.
+
+### Search sequence (verified 360 degrees)
+
+`CVPipeline._search_command` runs three phases once the owner is lost: **PREDICTED** (face the EKF's predicted bearing), **SWEEP** (swing out to +/-110 degrees around it for `SEARCH_SWEEP_SEC`), then **SCAN** (keep turning the same way, the side the owner left, at `SEARCH_SCAN_SPEED` until the integrated rotation reaches 360 degrees) and stop with `SEARCH_COMPLETE_360`. `tests/test_behaviors.py` drives it with a simulated yaw and asserts every 10-degree heading is visited. On the robot a 360 degree turn at 0.8 rad/s takes 8.4 s and stops about 14 degrees past the circle.
+
+### Tuning on the real robot
+
+`python tests/hw_follow_virtual.py [--gains=current,snappier-turn,...]` runs the real EKF and PID against a virtual person that walks, turns toward the roomier side and stops, while the real wheels, odometry and network latency close the loop. It needs about 2.5 m clear ahead and 0.5 m behind, and aborts if the LiDAR sees anything within 0.55 m ahead. It prints range and bearing error, end distance, peak speeds and turn activity per gain set, then the best one.

@@ -70,6 +70,14 @@ class PersonEKF:
         Q[2:, :2] = Q[:2, 2:]
         Q[2:, 2:] = np.eye(2) * q * dt ** 2
         self.P = F @ self.P @ F.T + Q
+
+    def coast(self, t, v_robot, w_robot, tau=2.0):
+        """Predict with no measurement. A person who just left view usually slows down, so velocity decays."""
+        if self.s is None:
+            return
+        dt = max(0.0, min(0.5, t - self.last_t))
+        self.predict(t, v_robot, w_robot)
+        self.s[2:] *= math.exp(-dt / tau)
         self.misses += 1
 
     def update(self, rng, bearing, sigma_r, sigma_b):

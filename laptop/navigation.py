@@ -154,3 +154,75 @@ class Planner:
             out.append(path[j])
             i = j
         return out
+
+
+MEMORY_SEC = 25.0       # how long a last-seen position is trusted
+VEL_TAU = 2.0           # a person who just went out of sight usually slows down
+MAX_EXTRAP_M = 1.5      # never assume they walked further than this since the last sighting
+
+
+class PersonMemory:
+    """Where the owner was last seen, kept in the map frame, so it survives the camera losing them
+    (low camera, an obstacle in the way) and the robot moving about while it goes round that obstacle."""
+
+    def __init__(self):
+        self.pos = None
+        self.vel = (0.0, 0.0)
+        self.t = 0.0
+
+    def clear(self):
+        self.pos = None
+
+    def update(self, person, pose, now):
+        """person is the EKF state in the robot frame. Only trusted while measurements are arriving (misses == 0)."""
+        if person is None or pose is None or person.get("misses", 1) > 0:
+            return
+        c, s = math.cos(pose[2]), math.sin(pose[2])
+        self.pos = (pose[0] + c * person["x"] - s * person["y"], pose[1] + s * person["x"] + c * person["y"])
+        self.vel = (c * person["vx"] - s * person["vy"], s * person["vx"] + c * person["vy"])
+        self.t = now
+
+    def age(self, now):
+        return now - self.t
+
+    def valid(self, now):
+        return self.pos is not None and self.age(now) < MEMORY_SEC
+
+    def estimate(self, now):
+        """Last position moved on by their last velocity, which decays, capped at MAX_EXTRAP_M."""
+        age = max(0.0, self.age(now))
+        travel = math.hypot(*self.vel) * VEL_TAU * (1.0 - math.exp(-age / VEL_TAU))
+        travel = min(travel, MAX_EXTRAP_M)
+        speed = math.hypot(*self.vel)
+        if speed < 1e-3:
+            return self.pos
+        return (self.pos[0] + self.vel[0] / speed * travel, self.pos[1] + self.vel[1] / speed * travel)
+
+
+def plan_with_memory(planner, grid, origin, pose, person, memory, now, desired):
+    """One planning step. Follows the live person when they are being measured; otherwise plans to where they
+    were last seen. Returns the plan dict (with memory/goal_dist/mem_* fields) or None if there is nothing to go to."""
+    if pose is None or origin is None:
+        return None
+    memory.update(person, pose, now)
+    tracking = person is not None and person.get("misses", 1) == 0
+    if tracking:
+        target, mem_mode = (person["x"], person["y"]), False
+    elif memory.valid(now):
+        wx, wy = memory.estimate(now)
+        c, s = math.cos(-pose[2]), math.sin(-pose[2])
+        dx, dy = wx - pose[0], wy - pose[1]
+        target, mem_mode = (c * dx - s * dy, s * dx + c * dy), True
+    else:
+        return None
+    plan = planner.plan(grid, origin, pose, target, desired)
+    goal = plan.get("goal")
+    plan.update({
+        "memory": mem_mode,
+        "mem_bearing": math.atan2(target[1], target[0]),
+        "mem_range": math.hypot(*target),
+        "age": memory.age(now) if mem_mode else 0.0,
+        "goal_dist": math.hypot(goal[0] - pose[0], goal[1] - pose[1]) if goal else 0.0,
+        "mem_world": memory.estimate(now) if mem_mode else None,
+    })
+    return plan
