@@ -111,7 +111,7 @@ class EndToEnd(unittest.TestCase):
                 s.close()
         cls.pi = subprocess.Popen(
             [sys.executable, "-u", str(ROOT / "pi" / "pi_turtlebot_node.py"), "--no-motors"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         os.environ["PI_IP"] = "127.0.0.1"
         from config import Config

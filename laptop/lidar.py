@@ -137,8 +137,9 @@ def sectors(ranges, exclude=None, max_range=3.5):
 class LidarAvoidance:
     """Bends and slows the follow command. Distances are from the LiDAR centre, robot radius is 0.105 m."""
 
-    def __init__(self, critical=0.30, warn=0.85, side=0.40):
+    def __init__(self, critical=0.30, warn=0.85, side=0.40, side_critical=0.20):
         self.critical, self.warn, self.side = critical, warn, side
+        self.side_critical = side_critical    # robot radius 0.105 m + margin: inside this a side is a keep-out
         self.bias = 1.0
 
     def apply(self, v, w, sec):
@@ -163,6 +164,17 @@ class LidarAvoidance:
         elif d_r < self.side and d_r < d_l:
             w += 0.5 * (self.side - d_r) / self.side
             status = status if status != "LIDAR_CLEAR" else "LIDAR_SIDE_R"
+        # Side keep-out. The nudge above is a bias the PID can overpower (it will turn hard toward a person
+        # round a corner). Inside side_critical the robot may not turn toward that side at all, is pushed away,
+        # and slows as the gap closes, so it cannot clip a door frame or wall corner it is passing.
+        for d_side, sign in ((d_l, 1.0), (d_r, -1.0)):
+            if d_side < self.side_critical:
+                k = max(0.0, d_side / self.side_critical)
+                push = 0.6 * (1.0 - k)
+                w = min(w, -push) if sign > 0 else max(w, push)
+                v *= max(0.35, k)
+                if status in ("LIDAR_CLEAR", "LIDAR_SIDE_L", "LIDAR_SIDE_R"):
+                    status = "LIDAR_SIDE_STOP"
         return v, w, status
 
 

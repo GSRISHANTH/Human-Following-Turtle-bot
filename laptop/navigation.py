@@ -44,6 +44,13 @@ class Planner:
         if person_cell is not None:
             cv2.circle(inflated, person_cell, int(round(0.55 / CELL)), 0, -1)
         cv2.circle(inflated, robot_cell, int(round(0.30 / CELL)), 0, -1)
+        # The bubble above lets a plan start when the robot is already inside the inflation, but it must not
+        # erase the obstacle itself: keep a hard core (one cell round every real return) blocked in the bubble,
+        # or the smoothed path and the look-ahead waypoint cut straight past a wall corner next to the robot.
+        hard = cv2.dilate(coarse, np.ones((3, 3), np.uint8))
+        if 0 <= robot_cell[0] < self.n and 0 <= robot_cell[1] < self.n:
+            hard[robot_cell[1], robot_cell[0]] = 0      # the start cell itself always stays plannable
+        inflated = np.maximum(inflated, hard)
         free = inflated == 0
         dist = cv2.distanceTransform(free.astype(np.uint8), cv2.DIST_L2, 3)
         return free, dist

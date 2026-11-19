@@ -7,7 +7,7 @@ Raspberry Pi companion node for the TurtleBot human follower. Pure UDP, nothing 
     out  UDP -> laptop  JPEG frames in datagrams, plus a small status packet at 2 Hz
 
 Velocity goes to ROS 2 (or ROS 1) /cmd_vel, with OpenCR serial as a last resort.
-If no packet arrives for 0.6 s the wheels are stopped.
+If no packet arrives for 0.35 s (CMD_TIMEOUT, about ten missed 30 Hz packets) the wheels are stopped.
 
     python3 pi_turtlebot_node.py                 camera + motors
     python3 pi_turtlebot_node.py --no-motors     camera and logging only
@@ -276,6 +276,10 @@ def watchdog_loop():
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
+try:
+    sock.ioctl(socket.SIO_UDP_CONNRESET, False)
+except (AttributeError, OSError, ValueError):
+    pass
 peer = None          # (ip, port) of the laptop video socket
 peer_time = 0.0      # monotonic
 peer_lock = threading.Lock()
@@ -286,6 +290,8 @@ def udp_rx_loop():
     while True:
         try:
             data, addr = sock.recvfrom(512)
+        except ConnectionResetError:
+            continue
         except OSError:
             return
         if data.startswith(b"HELLO"):
@@ -333,6 +339,27 @@ class Camera:
         self._open()
         if self.cap is not None:
             threading.Thread(target=self._loop, daemon=True).start()
+        else:
+            print("[Pi] Using synthetic camera test pattern generator.")
+            threading.Thread(target=self._synth_loop, daemon=True).start()
+
+    def _synth_loop(self):
+        import numpy as np
+        import cv2
+        n, t0 = 0, time.monotonic()
+        while self.running:
+            time.sleep(1.0 / max(1, TARGET_FPS))
+            frame = np.zeros((FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
+            cv2.putText(frame, f"SYNTHETIC PI FEED {time.strftime('%H:%M:%S')}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            with self.cond:
+                self.latest = frame
+                self.frame_no += 1
+                self.cond.notify_all()
+            n += 1
+            now = time.monotonic()
+            if now - t0 >= 1.0:
+                self.capture_fps = n / (now - t0)
+                n, t0 = 0, now
 
     def _open(self):
         import cv2
