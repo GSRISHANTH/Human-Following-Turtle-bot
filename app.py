@@ -58,8 +58,8 @@ def main():
                 print(f"[launcher] Restarting with {candidate}")
                 sys.exit(subprocess.call([candidate, str(Path(__file__).resolve())] + sys.argv[1:]))
         print("[launcher] No installed Python has mediapipe, opencv-python, flask and numpy.\n"
-              "           Run:  py -3.11 -m pip install mediapipe opencv-python flask numpy\n"
-              "           then: py -3.11 app.py")
+              "           Run:  py -3.14 -m pip install -r requirements.txt\n"
+              "           then: py -3.14 app.py")
         sys.exit(1)
     laptop = Path(__file__).resolve().parent / "laptop"
     sys.path.insert(0, str(laptop))

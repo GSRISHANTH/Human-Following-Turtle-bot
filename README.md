@@ -131,11 +131,22 @@ python app.py
 3. **Motor Velocity Commands (Laptop -> Pi)**: UDP `<PI_IP>:8888`, text `V:<m/s>,W:<rad/s>,S:<seq>` at 30 Hz. Allow UDP 5000 inbound for Python in Windows Firewall if no video arrives.
 4. **Dashboard**: video is forwarded untouched to the browser, the pose is drawn on a canvas, and telemetry is pushed over Server-Sent Events. The Link Health card shows video FPS, pose FPS, frame age, bitrate, drops and the Pi's own status.
 5. **Safety Watchdog**:
-   - The Raspberry Pi enforces a **0.60-second hardware watchdog**. If communication from the laptop drops for more than 600 ms, the Pi automatically zeroes motor speeds and stops the robot.
+   - Two watchdogs. The Raspberry Pi stops the wheels if no velocity packet arrives for **0.35 s** (`CMD_TIMEOUT`, about ten missed 30 Hz packets). On the laptop, `RobotController` zeroes the commanded velocity if the vision pipeline has not refreshed it for **0.60 s**.
 
 ---
 
 ## 4. Step-by-Step Launch Instructions
+
+### Install Dependencies (once)
+Laptop (Python 3.10 - 3.14; tested on 3.14.6):
+```powershell
+py -3.14 -m pip install -r requirements.txt
+py -3.14 -m unittest discover tests     # expect: Ran 106 tests ... OK
+```
+Raspberry Pi (ROS 2 Humble supplies rclpy and the message packages):
+```bash
+python3 -m pip install --user -r ~/pi/requirements.txt
+```
 
 ### Pre-Flight Hardware Checks:
 1. **Battery**: Check that the TurtleBot LiPo battery (11.1V – 12.6V) is securely connected to the OpenCR board.

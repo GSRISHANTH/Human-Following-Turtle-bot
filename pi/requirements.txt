@@ -1,0 +1,10 @@
+# Raspberry Pi 4 robot bridge (Ubuntu 22.04, ROS 2 Humble, system Python 3.10).
+# rclpy, geometry_msgs, sensor_msgs and std_srvs come from ROS 2 Humble (apt), not pip.
+# Install:  python3 -m pip install --user -r requirements.txt
+#
+# numpy stays below 2 so it matches the numpy 1.x that ROS 2 Humble's apt packages are built against.
+# Headless OpenCV: the Pi has no display, and this avoids pulling in Qt/X11.
+numpy>=1.21,<2
+opencv-python-headless>=4.5,<4.11
+# Optional: direct OpenCR serial fallback when ROS 2 is not running.
+pyserial>=3.5

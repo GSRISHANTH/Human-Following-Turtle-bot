@@ -1,0 +1,23 @@
+# Laptop AI station (dashboard, perception, Re-ID, planner, tests).
+# Supported: Python 3.10 - 3.14.   Install:  py -3.14 -m pip install -r requirements.txt
+#
+# Verified set (Windows 11, Python 3.14.6, 106/106 tests passing):
+#   mediapipe 1.1.1 | opencv-python 5.0.0.93 | numpy 2.5.3 | Flask 3.1.3
+#
+# Ranges, not single pins, because no one numpy release covers 3.10 - 3.14 (numpy >= 2.3 dropped 3.10).
+# Upper bounds stop a future major release from breaking the build.
+
+# Pose: Tasks API PoseLandmarker with pose_landmarker_lite.task (needs >= 0.10.14). Capped at the tested line.
+mediapipe>=0.10.14,<1.2
+
+# Video decode, HSV histograms, Sobel corridors, HOG, occupancy-grid morphology.
+# mediapipe already depends on opencv-contrib-python (a superset of opencv-python), so it is the one cv2
+# provider. opencv-python and opencv-contrib-python both install the same cv2 module: if you also have
+# opencv-python, keep it at exactly the same version, or uninstall it (pip uninstall opencv-python).
+opencv-contrib-python>=4.9,<6
+
+numpy>=1.26,<2.3; python_version < "3.11"
+numpy>=2.0,<3; python_version >= "3.11"
+
+# Web dashboard (port 8000) and Server-Sent Events telemetry.
+Flask>=3.0,<4
