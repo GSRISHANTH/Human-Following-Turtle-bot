@@ -8,6 +8,7 @@ child process, sends velocity back over UDP, and serves the dashboard:
 The browser draws the pose and boxes on a canvas over the video.
 """
 
+import ipaddress
 import json
 import math
 import time
@@ -50,7 +51,7 @@ latest_telemetry = {
     "dropped": 0,
     "frame_age_ms": None,
     "pi": {},
-    "target_state": "SEARCHING",
+    "target_state": Config.STATE_IDLE,
     "target_id": None,
     "detected": False,
     "distance_m": 0.0,
@@ -68,7 +69,7 @@ latest_telemetry = {
     "last_update": time.time(),
     "overlay": [],
     "pose_fps": 0.0,
-    "calibration": 210.0,
+    "calibration": Config.DISTANCE_SCALE,
     "owner_enrolled": False,
 }
 telemetry_lock = threading.Lock()
@@ -81,7 +82,8 @@ _TELEM_KEYS = (
     "is_owner_matched", "owner_match_score", "people_count", "safety_status",
     "safety_alerts", "phase2_cmd_vel", "obstacle_distances", "nav_status",
     "robot_telemetry", "events", "overlay", "pose_fps", "calibration", "following_enabled",
-    "person", "fusion", "reid",
+    "person", "fusion", "reid", "lidar_cam", "camera", "control", "safety_latched", "ambiguous",
+    "video_lost", "settings",
 )
 
 lidar_map = LidarMap()
@@ -108,8 +110,14 @@ def _feed_pose():
     while is_processing:
         try:
             seq, jpg = streamer.wait_new(last_seq, 0.25)
-            if jpg is not None and seq != last_seq:
+            if seq == last_seq:
+                jpg = None                      # timed out: nothing new, never re-send the same frame
+            elif jpg is not None:
                 last_seq = seq
+                if not streamer.camera_frame_ok():
+                    # offline pattern or the Pi's "no camera" picture: perception must not act on it
+                    jpg = None
+            if jpg is not None:
                 t_rx = streamer.last_frame_time
                 try:
                     if jpeg_q.full():
@@ -190,13 +198,17 @@ def _lidar_step(last, last_render):
                 cmd_q.put_nowait({"op": "lidar", "wait": False, "bins": scan["bins"]})
             except Exception:
                 pass
+            with telemetry_lock:
+                person = latest_telemetry.get("person")
             with lidar_lock:
-                lidar_map.update(scan["bins"], scan["pose"])
+                lidar_map.update(scan["bins"], scan["pose"], person=(person["x"], person["y"]) if person else None,
+                                 pose_src=scan.get("pose_src", "odom"))
         if now - last_render >= 0.1:
             last_render = now
             with telemetry_lock:
                 person = latest_telemetry.get("person")
                 fusion = latest_telemetry.get("fusion") or {}
+                camera = latest_telemetry.get("camera") or {}
             with lidar_lock:
                 sec = None
                 if lidar_map.bins is not None and now - lidar_map.stamp < 1.0:
@@ -204,13 +216,16 @@ def _lidar_step(last, last_render):
                     if person:
                         ex = (math.radians(person["bearing_deg"]), 0.25, person["range"])
                     sec = lidar_sectors(lidar_map.bins, exclude=ex)
-                view = lidar_map.render(person=person, sec=sec, plan=latest_plan)
+                view = lidar_map.render(person=person, sec=sec, plan=latest_plan, hfov_deg=Config.CAMERA_HFOV_DEG,
+                                        cam_yaw_deg=camera.get("yaw_deg", 0.0))
                 loc = None
                 if lidar_map.pose is not None:
                     loc = {"x": round(lidar_map.pose[0] - lidar_map.origin[0], 2), "y": round(lidar_map.pose[1] - lidar_map.origin[1], 2),
                            "yaw": round(math.degrees(lidar_map.pose[2]), 1), "score": round(lidar_map.loc_score, 2),
                            "shift": round(lidar_map.loc_shift, 2), "scans": lidar_map.scans,
-                           "moving": sum(1 for l in lidar_map.labels if l == "moving")}
+                           "moving": sum(1 for l in lidar_map.labels if l == "moving"),
+                           "source": lidar_map.source, "ok": lidar_map.loc_ok, "recenters": lidar_map.recenters,
+                           "resets": lidar_map.resets}
             with telemetry_cond:
                 latest_telemetry["localization"] = loc
                 latest_telemetry["clearance"] = sec
@@ -496,44 +511,75 @@ def api_test_motors():
 
 
 def _config_view():
-    with telemetry_lock:
-        calibration = latest_telemetry.get("calibration", 210.0)
     return {
         "pi_ip": Config.PI_IP,
         "stream_url": streamer.stream_url,
         "source_mode": streamer.source_mode,
-        "calibration": calibration,
+        "calibration": Config.DISTANCE_SCALE,
         "target_distance": Config.TARGET_DISTANCE,
+        "settings": Config.tunables(),
     }
+
+
+def _apply_settings(values):
+    """Validate in this process first (types, ranges, IP), then hand the accepted ones to the vision process."""
+    accepted, rejected = {}, {}
+    limits = {"DESIRED_DISTANCE": (Config.MIN_FOLLOW_DISTANCE, 3.5), "DISTANCE_SCALE": (0.5, 2.0),
+              "CAMERA_HFOV_DEG": (30.0, 160.0), "CAM_HEIGHT_M": (0.0, 1.5), "LIDAR_HEIGHT_M": (0.0, 1.0),
+              "CAM_X_M": (-0.5, 0.5), "CAM_Y_M": (-0.5, 0.5), "CAM_YAW_DEG": (-45.0, 45.0), "CAM_PITCH_DEG": (-45.0, 45.0),
+              "MAX_LINEAR_VEL": (0.0, 0.26), "MAX_ANGULAR_VEL": (0.0, 2.84)}
+    for name, raw in (values or {}).items():
+        name = str(name).upper()
+        if name not in Config.TUNABLE:
+            rejected[name] = "not tunable"
+            continue
+        try:
+            v = Config.coerce(name, raw)
+            if name in limits:
+                lo, hi = limits[name]
+                if not lo <= v <= hi:
+                    raise ValueError(f"must be in [{lo}, {hi}]")
+            if name.startswith("PID_") and not 0.0 <= v <= 10.0:
+                raise ValueError("must be in [0, 10]")
+            if name == "PI_IP":
+                ipaddress.ip_address(v)
+        except (ValueError, TypeError, KeyError) as e:
+            rejected[name] = str(e)
+            continue
+        Config.set(name, v)
+        accepted[name] = v
+    if "PI_IP" in accepted:
+        streamer.update_pi_ip(Config.PI_IP)
+    if accepted:
+        _cv_call("set", values=accepted)
+    return accepted, rejected
 
 
 @app.route("/api/config", methods=["GET", "POST"])
 def api_config():
     if request.method == "POST":
-        req_data = request.get_json() or {}
-
+        req_data = request.get_json(silent=True) or {}
+        values = dict(req_data.get("settings") or {})
+        # older dashboard keys
         if "pi_ip" in req_data:
-            Config.PI_IP = req_data["pi_ip"].strip()
-            streamer.update_pi_ip(Config.PI_IP)
-            _cv_call("pi_ip", ip=Config.PI_IP)
-
-        if "source_mode" in req_data:
-            streamer.set_source_mode(req_data["source_mode"])
-
+            values["PI_IP"] = req_data["pi_ip"]
         if "calibration" in req_data:
-            try:
-                _cv_call("calibration", value=float(req_data["calibration"]))
-            except ValueError:
-                pass
-
+            values["DISTANCE_SCALE"] = req_data["calibration"]
         if "target_distance" in req_data:
+            values["DESIRED_DISTANCE"] = req_data["target_distance"]
+        if "source_mode" in req_data and req_data["source_mode"] in ("network", "sim"):
+            streamer.set_source_mode(req_data["source_mode"])
+        accepted, rejected = _apply_settings(values)
+        saved = False
+        if req_data.get("save") and accepted:
             try:
-                Config.TARGET_DISTANCE = max(Config.MIN_FOLLOW_DISTANCE, min(3.5, float(req_data["target_distance"])))
-                _cv_call("target_distance", value=Config.TARGET_DISTANCE)
-            except ValueError:
-                pass
-
-        return jsonify({"status": "success", "config": _config_view()})
+                Config.save_local(accepted)
+                saved = True
+            except OSError as e:
+                rejected["_save"] = str(e)
+        status = "success" if not rejected else ("partial" if accepted else "error")
+        return jsonify({"status": status, "accepted": accepted, "rejected": rejected, "saved": saved,
+                        "config": _config_view()}), (200 if accepted or not rejected else 400)
 
     return jsonify(_config_view())
 

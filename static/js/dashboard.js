@@ -74,6 +74,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     // --- Telemetry: pushed by the server as each pose result lands ---
     let latestOverlay = [];
+    let latestLidarCam = [];
     let overlayAt = 0;
     let lastPoseStamp = 0;
 
@@ -85,9 +86,12 @@ document.addEventListener("DOMContentLoaded", () => {
             if (data.last_update !== lastPoseStamp) {
                 lastPoseStamp = data.last_update;
                 latestOverlay = data.overlay || [];
+                latestLidarCam = data.lidar_cam || [];
                 overlayAt = performance.now();
+                recordSample(data);
             }
             updateUI(data);
+            updateAnalysis(data);
         };
         es.onerror = () => {
             connDot.className = "status-dot offline";
@@ -287,8 +291,9 @@ document.addEventListener("DOMContentLoaded", () => {
             }
 
             // 6. Event Terminal
-            if (eventTerminal && data.events && data.events.length > 0 && data.events.length !== lastRenderedEventsCount) {
-                lastRenderedEventsCount = data.events.length;
+            const evKey = data.events && data.events.length ? JSON.stringify(data.events[data.events.length - 1]) + data.events.length : "";
+            if (eventTerminal && evKey && evKey !== lastRenderedEventsCount) {
+                lastRenderedEventsCount = evKey;
                 eventTerminal.innerHTML = "";
                 data.events.forEach(evt => {
                     const el = document.createElement("div");
@@ -686,30 +691,12 @@ document.addEventListener("DOMContentLoaded", () => {
     const ctx2d = canvas ? canvas.getContext("2d") : null;
     let pendingBitmap = null;
     let shownBitmap = null;
-    const LINKS = [[11, 12], [11, 23], [12, 24], [23, 24], [11, 13], [13, 15], [12, 14], [14, 16],
-                   [23, 25], [25, 27], [24, 26], [26, 28], [0, 1], [1, 2], [2, 3], [3, 7], [0, 4], [4, 5], [5, 6], [6, 8]];
 
+    const layer = (id) => { const el = document.getElementById(id); return !el || el.checked; };
     function drawOverlay(w, h) {
         if (performance.now() - overlayAt > 900) return;
-        latestOverlay.forEach((p) => {
-            const pts = {};
-            (p.pose || []).forEach((it) => { if (it.length >= 4) pts[it[0]] = it; });
-            ctx2d.lineWidth = 2;
-            ctx2d.strokeStyle = "#00f0ff";
-            LINKS.forEach(([a, b]) => {
-                const pa = pts[a], pb = pts[b];
-                if (!pa || !pb || pa[3] < 0.35 || pb[3] < 0.35) return;
-                ctx2d.beginPath();
-                ctx2d.moveTo(pa[1] * w, pa[2] * h);
-                ctx2d.lineTo(pb[1] * w, pb[2] * h);
-                ctx2d.stroke();
-            });
-            if (p.bbox && p.bbox.length === 4) {
-                ctx2d.strokeStyle = p.target ? "#50dc3c" : "#ffb703";
-                ctx2d.lineWidth = p.target ? 3 : 2;
-                ctx2d.strokeRect(p.bbox[0] * w, p.bbox[1] * h, (p.bbox[2] - p.bbox[0]) * w, (p.bbox[3] - p.bbox[1]) * h);
-            }
-        });
+        window.HFViz.drawOverlay(ctx2d, w, h, latestOverlay, latestLidarCam,
+            { lidar: layer("lyr-lidar"), pose: layer("lyr-pose"), boxes: layer("lyr-boxes") });
     }
 
     function paint() {
@@ -769,5 +756,91 @@ document.addEventListener("DOMContentLoaded", () => {
         pumpLive();
     }
 
+    // --- Analysis deck: control-loop charts, state machine, alert banner, live settings ---
+    const V = window.HFViz;
+    const samples = [];
+    const nowS = () => performance.now() / 1000;
+    function recordSample(d) {
+        const c = d.control || {}, rt = d.robot_telemetry || {}, r = d.reid || {};
+        samples.push({
+            t: nowS(), state: d.target_state,
+            range: d.detected || (d.fusion && d.fusion.lidar_only) ? d.distance_m : null,
+            desired: c.desired ?? null, stop: c.stop ?? null, resume: c.resume ?? null,
+            v: rt.current_linear ?? null, v_cmd: c.cmd_v ?? null,
+            w: rt.current_angular ?? null, w_cmd: c.cmd_w ?? null,
+            match: d.reid ? r.best : null, thr: d.reid ? r.thr : null,
+        });
+        while (samples.length && samples[0].t < nowS() - 31) samples.shift();
+    }
+    const charts = [];
+    const mk = (id, opts) => { const el = document.getElementById(id); if (el) charts.push(new V.TimeChart(el, opts)); };
+    mk("ch-range", { series: [{ key: "range", label: "range", color: V.SERIES.actual }], refs: [{ key: "desired", label: "set" }],
+                     band: { lo: "stop", hi: "resume", label: "wait band" }, min: 0.5, max: 2.0, unit: " m", digits: 2 });
+    mk("ch-v", { series: [{ key: "v", label: "actual", color: V.SERIES.actual }, { key: "v_cmd", label: "commanded", color: V.SERIES.commanded, dash: [5, 3] }],
+                 min: 0, max: 0.25, unit: " m/s", digits: 2 });
+    mk("ch-w", { series: [{ key: "w", label: "actual", color: V.SERIES.actual }, { key: "w_cmd", label: "commanded", color: V.SERIES.commanded, dash: [5, 3] }],
+                 min: -1, max: 1, unit: " rad/s", digits: 2 });
+    mk("ch-reid", { series: [{ key: "match", label: "match", color: V.SERIES.actual }], refs: [{ key: "thr", label: "needs" }],
+                    min: 0, max: 1, autoMin: false, digits: 2 });
+    (function drawCharts() {
+        const t = nowS();
+        charts.forEach((c) => c.draw(samples, t));
+        requestAnimationFrame(drawCharts);
+    })();
+
+    const fsmSvg = document.getElementById("fsm-svg");
+    if (fsmSvg) V.buildFSM(fsmSvg);
+    const banner = document.getElementById("alert-banner");
+
+    function updateAnalysis(d) {
+        if (fsmSvg) {
+            const extra = d.fusion && d.fusion.lidar_only ? "(tracking on LiDAR only)" : "";
+            V.updateFSM(fsmSvg, d.target_state, extra);
+        }
+        if (banner) {
+            let msg = null, cls = "";
+            if (d.video_lost || (d.connected === false && d.source_mode !== "sim")) { msg = "VIDEO LOST: robot stopped until camera frames return"; cls = "critical"; }
+            else if (d.safety_latched) { msg = "STOP LATCHED: owner raises one hand (FOLLOW ME) or press START to resume"; cls = "critical"; }
+            else if (d.ambiguous) { msg = "TWO LOOK-ALIKES: holding still until they separate"; cls = "warning"; }
+            else if ((d.robot_telemetry || {}).emergency_stop) { msg = "E-STOP: press AUTO FOLLOW to release"; cls = "critical"; }
+            banner.hidden = !msg;
+            if (msg) { banner.textContent = msg; banner.className = "alert-banner " + cls; }
+        }
+        if (d.settings && !settingsBuilt) buildSettingsOnce(d.settings);
+    }
+
+    const form = document.getElementById("settings-form");
+    const msgEl = document.getElementById("settings-msg");
+    let settingsBuilt = false, settingsOrig = {};
+    function buildSettingsOnce(values) {
+        if (!form) return;
+        settingsOrig = { ...values };
+        V.buildSettings(form, values);
+        settingsBuilt = true;
+    }
+    fetch("/api/config").then((r) => r.json()).then((c) => { if (c.settings) buildSettingsOnce(c.settings); }).catch(() => {});
+    async function pushSettings(save) {
+        const changed = V.readSettings(form, settingsOrig);
+        if (!Object.keys(changed).length && !save) { msgEl.textContent = "No changes."; return; }
+        try {
+            const res = await fetch("/api/config", { method: "POST", headers: { "Content-Type": "application/json" },
+                                                     body: JSON.stringify({ settings: changed, save }) });
+            const j = await res.json();
+            const bad = Object.entries(j.rejected || {}).map(([k, v]) => `${k}: ${v}`);
+            msgEl.textContent = (Object.keys(j.accepted || {}).length ? `Applied ${Object.keys(j.accepted).length}` : "Nothing applied")
+                + (j.saved ? ", saved." : ".") + (bad.length ? `  Rejected: ${bad.join("; ")}` : "");
+            msgEl.className = "settings-msg " + (bad.length ? "bad" : "ok");
+            if (j.config && j.config.settings) { settingsOrig = { ...j.config.settings }; }
+            if (j.accepted && j.accepted.DESIRED_DISTANCE && followDist) {
+                followDist.value = j.accepted.DESIRED_DISTANCE;
+                followDistVal.textContent = `${Number(j.accepted.DESIRED_DISTANCE).toFixed(2)} m`;
+            }
+        } catch (e) { msgEl.textContent = "Dashboard server unreachable."; msgEl.className = "settings-msg bad"; }
+    }
+    const bA = document.getElementById("btn-settings-apply"), bS = document.getElementById("btn-settings-save");
+    if (bA) bA.addEventListener("click", () => pushSettings(false));
+    if (bS) bS.addEventListener("click", () => pushSettings(true));
+
     connectTelemetry();
 });
+

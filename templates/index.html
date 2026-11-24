@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/css/style.css?v=7">
+    <link rel="stylesheet" href="/static/css/style.css?v=10">
 </head>
 <body>
     {% if hil %}
@@ -74,6 +74,7 @@
 
                 <div class="video-wrapper">
                     <canvas id="live-canvas" width="640" height="480"></canvas>
+                    <div class="alert-banner" id="alert-banner" hidden></div>
                     <div class="video-overlay top-left">
                         <span class="overlay-tag ai-tag">CV ENGINE ACTIVE</span>
                         <span class="overlay-tag" id="distance-badge">-- m</span>
@@ -85,7 +86,12 @@
                 </div>
 
                 <div class="video-card-footer">
-                    <span class="footer-info" id="display-stream-ip">Pi camera over UDP. Newest frame only. Pose is drawn in the browser and never delays the picture.</span>
+                    <div class="layer-toggles" role="group" aria-label="Overlay layers">
+                        <label><input type="checkbox" id="lyr-lidar" checked> LiDAR co-map</label>
+                        <label><input type="checkbox" id="lyr-pose" checked> Skeleton</label>
+                        <label><input type="checkbox" id="lyr-boxes" checked> Boxes &amp; ranges</label>
+                    </div>
+                    <div class="range-key" aria-hidden="true"><span>LiDAR range</span><i class="rk-bar"></i><span>0.3 m</span><span>4 m</span><i class="rk-owner"></i><span>owner beams</span></div>
                 </div>
             </section>
 
@@ -149,6 +155,33 @@
             </aside>
             </div>
         </main>
+
+        <!-- State machine, control loop and live settings -->
+        <section class="analysis-deck">
+            <div class="deck-card fsm-card">
+                <div class="card-title"><span>STATE MACHINE</span><span class="card-sub" id="fsm-dwell">--</span></div>
+                <svg id="fsm-svg" viewBox="0 0 696 320" role="img" aria-label="Follow state machine, current state highlighted"></svg>
+                <div class="fsm-legend" id="fsm-why">--</div>
+            </div>
+            <div class="deck-card ctl-card">
+                <div class="card-title"><span>CONTROL LOOP</span><span class="card-sub">last 30 s &middot; hover for values</span></div>
+                <div class="chart-grid">
+                    <figure class="chart"><figcaption>Range to owner (m)</figcaption><canvas id="ch-range"></canvas></figure>
+                    <figure class="chart"><figcaption>Linear velocity (m/s) <span class="lg"><i class="sw sw-a"></i>actual <i class="sw sw-c"></i>commanded</span></figcaption><canvas id="ch-v"></canvas></figure>
+                    <figure class="chart"><figcaption>Angular velocity (rad/s) <span class="lg"><i class="sw sw-a"></i>actual <i class="sw sw-c"></i>commanded</span></figcaption><canvas id="ch-w"></canvas></figure>
+                    <figure class="chart"><figcaption>Owner match score</figcaption><canvas id="ch-reid"></canvas></figure>
+                </div>
+            </div>
+            <div class="deck-card settings-card">
+                <div class="card-title"><span>LIVE SETTINGS</span><span class="card-sub">applied instantly &middot; Save writes config.local.json</span></div>
+                <form id="settings-form" autocomplete="off"></form>
+                <div class="settings-actions">
+                    <button type="button" class="btn btn-toggle" id="btn-settings-apply">APPLY</button>
+                    <button type="button" class="btn btn-toggle" id="btn-settings-save">APPLY &amp; SAVE</button>
+                    <span class="settings-msg" id="settings-msg" role="status"></span>
+                </div>
+            </div>
+        </section>
 
         <!-- Comprehensive Intelligence & Motion Deck -->
         <section class="dashboard-deck">
@@ -328,6 +361,7 @@
         </section>
     </div>
 
-    <script src="/static/js/dashboard.js?v=7"></script>
+    <script src="/static/js/viz.js?v=10"></script>
+    <script src="/static/js/dashboard.js?v=10"></script>
 </body>
 </html>
