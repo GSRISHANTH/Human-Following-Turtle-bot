@@ -121,7 +121,7 @@ For a body segment of real length $L$ that spans $s$ pixels, the pinhole model g
 
 $$\hat d_{cam} = \operatorname{clip}\!\left(\frac{1}{n}\sum_{i=1}^{n}\frac{K_i}{s_i}\cdot\frac{W}{640},\; 0.35,\; 4.5\right)\text{ m}$$
 
-If no anchor is usable, the bounding-box height is used instead: $\hat d = 320/h_{bbox}\cdot W/640$. Averaging the anchors reduces the error caused by any one of them: shoulder width shrinks when the person turns sideways, and torso height shrinks when they lean. Monocular range error grows with distance, so the EKF gives the camera range a standard deviation of $\sigma_r = 0.12\,d$. When the LiDAR range agrees, a scale factor $k_v \in [0.6, 1.6]$ is adapted ($k_v \leftarrow 0.98k_v + 0.02\,r_{lidar}/\hat d$), so the camera gradually calibrates itself against the LiDAR.
+Each constant is $K_i = f_{px}\,L_i$ with the real size $L_i$ taken from `Config` (`PERSON_SHOULDER_M` = 0.40, `PERSON_HIP_M` = 0.27, `PERSON_TORSO_M` = 0.39), so changing the camera FOV or resolution needs no new constants; the result is multiplied by `DISTANCE_SCALE` (dashboard calibration). If no anchor is usable, the bounding-box height is used instead ($L$ = `PERSON_BOX_M` = 0.54 m). Averaging the anchors reduces the error caused by any one of them: shoulder width shrinks when the person turns sideways, and torso height shrinks when they lean. Monocular range error grows with distance, so the EKF gives the camera range a standard deviation of $\sigma_r = 0.12\,d$. When the LiDAR range agrees, a scale factor $k_v \in [0.6, 1.6]$ is adapted ($k_v \leftarrow 0.98k_v + 0.02\,r_{lidar}/\hat d$), so the camera gradually calibrates itself against the LiDAR.
 
 ### 4.3 HSV appearance signature and Bhattacharyya distance
 
@@ -223,6 +223,44 @@ A search rotation is suppressed if the side it turns toward has an obstacle with
 
 ---
 
+### 4.9 SLAM: localisation and mapping on the laptop
+
+The robot pose comes from the best available source:
+
+1. **slam_toolbox / Cartographer on the Pi** (`SLAM=1`): TF `map → base_footprint` is sent with each scan (pose flag 2) and used directly.
+2. **Wheel odometry + scan matching** (default): the odometry-to-map correction $T$ is re-estimated every scan.
+3. **Scan matching only** (no `/odom`): the prior is the last pose plus the last pose change (constant velocity).
+
+**Likelihood field.** From the log-odds grid ($0.05$ m cells), $d(c)$ is the distance from cell $c$ to the nearest occupied cell, and $L(c) = \exp(-d(c)^2 / 2\sigma^2)$ with $\sigma = 0.06$ m. A scan of points $p_k$ (robot frame) at pose $\xi = (x, y, \theta)$ scores
+
+$$S(\xi) = \frac{1}{K}\sum_k L\big(R(\theta)\,p_k + t\big) \in [0, 1].$$
+
+**Multi-resolution correlative search** (Olson, M3RSM). Level 1 of a max-pooled pyramid (0.10 m cells, dilated by one cell so that a coarse score bounds the fine score) is searched exhaustively over $\pm 0.30$ m and $\pm 15^\circ$ in $1.5^\circ$ steps. A small penalty favours the motion prior, so a featureless corridor cannot slide. The four best candidates are then refined at level 0 over $\pm 0.10$ m and $\pm 1^\circ$.
+
+**Gauss-Newton refinement** (Hector SLAM). On the bilinearly interpolated field $M$, minimise $\sum_k (1 - M(S_k(\xi)))^2$:
+
+$$\Delta\xi = H^{-1}\sum_k \nabla M\,\frac{\partial S_k}{\partial \xi}^{T}\big(1 - M(S_k)\big),\quad H = \sum_k \Big(\nabla M\,\frac{\partial S_k}{\partial \xi}\Big)^{T}\Big(\nabla M\,\frac{\partial S_k}{\partial \xi}\Big),\quad \frac{\partial S_k}{\partial \xi} = \begin{bmatrix}1 & 0 & -\sin\theta\,p_x - \cos\theta\,p_y\\ 0 & 1 & \cos\theta\,p_x - \sin\theta\,p_y\end{bmatrix}$$
+
+**Acceptance.** A match is accepted only if $S \ge 0.35$ and it is at least as good as the prior. Otherwise the prior is kept, and in scan-only mode the scan is not integrated, so a bad guess never corrupts the map.
+
+**Mapping.**
+- **Dynamic objects:** clusters near the tracked owner, or appearing in space previously observed free, are not marked occupied. A new object that stays in the same 0.3 m bucket for 8 scans (a box set down) is promoted to static and mapped.
+- **Moving window:** the 12 × 12 m grid shifts by whole cells when the robot comes within 2.5 m of its edge.
+- **Restarts:** an odometry restart (a jump > 0.6 m or > 70° between scans) or a change of pose source starts a new map.
+
+### 4.10 LiDAR–camera co-mapping
+
+With the camera at $c = (x_c, y_c, h_c)$, yaw $\psi$ (configured plus the online bias $b_{cam}$) and pitch $\phi$, a LiDAR return at range $r$ and bearing $\beta$ lies at $P = (r\cos\beta,\ r\sin\beta,\ h_l)$. In the camera frame:
+
+$$\begin{aligned} x' &= \cos\psi\,\Delta x + \sin\psi\,\Delta y, & y' &= -\sin\psi\,\Delta x + \cos\psi\,\Delta y, & z' &= \Delta z\\ \text{depth} &= \cos\phi\,x' - \sin\phi\,z', & \text{up} &= \sin\phi\,x' + \cos\phi\,z' & \end{aligned}$$
+
+$$u = \frac{W}{2} - f_{px}\,\frac{y'}{\text{depth}}, \qquad v = \frac{H}{2} - f_{px}\,\frac{\text{up}}{\text{depth}}$$
+
+Uses:
+- **Overlay:** beams with depth > 0.05 m inside the image are drawn over the live video, coloured by range.
+- **Per-person LiDAR range:** the beams whose column $u$ falls inside a person's box, nearest compact group, within 40% of the camera estimate.
+- **EKF association:** the LiDAR person cluster is accepted only if its bearing lies within the box's angular half-width + 2°, instead of a fixed window.
+
 ## 5. State Machine
 
 ### 5.1 States
@@ -236,8 +274,8 @@ A search rotation is suppressed if the side it turns toward has an obstacle with
 | `TARGET_TEMPORARILY_LOST` | Owner not in camera or LiDAR; 0.4 s hold, or waiting for the first plan | Stopped |
 | `RECALLING_LAST_POSITION` | Driving to the remembered position via A* | ≤ 0.15 m/s + avoidance |
 | `SEARCH_ROTATING` | 3-phase rotational search | Rotation only, ≤ 1.0 rad/s |
-| `TARGET_AMBIGUOUS` | Two candidates indistinguishable ($\Delta S < 0.08$) | Stopped |
-| `SAFETY_STOP` | `STOP_HALT` gesture held | Stopped |
+| `TARGET_AMBIGUOUS` | Two candidates indistinguishable ($\Delta S < 0.08$, including position continuity) | Stopped; no loss timer, so never recall or search |
+| `SAFETY_STOP` | `STOP_HALT` seen (latched) | Stopped until the owner's `FOLLOW_ME` or START |
 | `OWNER_RELEASED` | `RELEASE` gesture or button; profile deleted | Stopped |
 | `MANUAL_CONTROL` | Dashboard teleoperation (controller mode `MANUAL`); autonomous commands ignored | Operator |
 
@@ -261,7 +299,8 @@ A search rotation is suppressed if the side it turns toward has an obstacle with
 | `SEARCH_ROTATING` | Re-ID gate passes (§4.3) | `FOLLOWING` / `WAIT…` |
 | `SEARCH_ROTATING` | 360° covered or 30 s | `TARGET_TEMPORARILY_LOST` (halted) |
 | any tracked state | top two candidates ≥ 0.40 and within 0.08 | `TARGET_AMBIGUOUS` |
-| any | `STOP_HALT` (both hands up) | `SAFETY_STOP` (held while the gesture persists) |
+| any | `STOP_HALT` from **anyone** in view | `SAFETY_STOP`, **latched** |
+| `SAFETY_STOP` | owner's `FOLLOW_ME`, or dashboard START | `FOLLOWING` |
 | any with owner | `RELEASE` (crossed arms) or dashboard *Release* | `OWNER_RELEASED` → `IDLE` |
 
 ### 5.3 Gestures (MediaPipe landmarks, normalised image coordinates, y grows downwards)
@@ -273,7 +312,7 @@ A search rotation is suppressed if the side it turns toward has an obstacle with
 | `FOLLOW_ME` | Either wrist ≥ 0.04 above the nose | Enroll, or resume following |
 | `WAIT` | Wrist between nose and shoulder height and above its elbow (upright forearm) | Pause following |
 
-Gestures are evaluated in the priority order above and must persist for 4 consecutive frames before they fire. A held gesture fires only once; it can fire again only after the hands return to a neutral pose. (`Config.GESTURE_COOLDOWN_SEC` is declared but not currently used.)
+Once an owner is enrolled, only the **owner's** gestures are obeyed: they are classified after identity matching, and a bystander's `FOLLOW_ME`, `WAIT` or `RELEASE` is ignored and logged (`GESTURE_IGNORED`). `STOP_HALT` is accepted from anyone. Before enrollment, the person performing `FOLLOW_ME` is the one enrolled. A profile restored from disk never starts following on boot. Gestures are evaluated in the priority order above and must persist for 4 consecutive frames before they fire. A held gesture fires only once; it can fire again only after the hands return to a neutral pose. (`Config.GESTURE_COOLDOWN_SEC` is declared but not currently used.)
 
 ---
 
@@ -292,7 +331,7 @@ The layers are independent: each one can stop the robot even if every layer abov
 | 7 | Speed and acceleration limits | Laptop | 0.22 m/s, 2.0 rad/s, 1.6 m/s², 8 rad/s² | Clamp and slew |
 | 8 | Laptop command watchdog | Laptop | No pipeline update for 0.60 s | Target velocity → 0 |
 | 9 | **Pi command watchdog** | Raspberry Pi | No UDP command for **0.35 s** (≈ 10 packets at 30 Hz) | `/cmd_vel` = 0 published to OpenCR |
-| 10 | Stale video | Laptop | Frame older than 0.8 s | Stream treated as lost |
+| 10 | Stale or fake video | Laptop | No camera frame for 0.8 s; the laptop's offline test pattern; the Pi's "no camera" placeholder; frames before the first Pi status | Frames never reach perception; `VIDEO_LOST`, robot stopped |
 | 11 | Search limits | Laptop | Recall ≤ 25 s, search ≤ 30 s / 360° | Halt and wait for the owner |
 | 12 | Test isolation | Tests | `tests/__init__.py` and `conftest.py` force `COMMAND_MODE="mock"`, `PI_IP=127.0.0.1` | The test suite can never drive the real robot |
 
@@ -319,7 +358,7 @@ All figures below were measured on the development laptop (AMD Ryzen 7 6800HS, W
 
 ### 8.1 Automated test suite
 
-`python -m unittest discover tests` → **Ran 106 tests — OK** (3 consecutive full runs, about 25 s each).
+`python -m unittest discover tests` → **Ran 128 tests — OK, 0 skipped** (3 consecutive full runs, about 22 s each).
 
 | File | Tests | Covers |
 |---|---|---|
@@ -332,6 +371,8 @@ All figures below were measured on the development laptop (AMD Ryzen 7 6800HS, W
 | `test_fusion_pipeline.py` | 4 | Camera + LiDAR fusion inside the real pipeline |
 | `test_hil_plant.py` | 4 | Burger kinematic plant used by the HIL bench |
 | `test_recall_sim.py` | 1 | Owner hides behind a wall; robot detours through the gap and re-locks |
+| `test_pipeline_states.py` | 8 | Real `process_frame` with injected people: bystander gestures ignored, STOP latch, look-alikes hold, post-transition state, per-person LiDAR range, restored profile does not drive |
+| `test_fusion_config.py` | 11 | Projection geometry (centre, pinhole, yaw, pitch, FOV clipping, wall behind the person), config overrides and validation, stale/fake video gate |
 
 ### 8.2 Closed-loop following (simulation)
 
@@ -369,10 +410,24 @@ The fix keeps a hard core around real returns inside the bubble (§4.8) and adds
 | EKF predict + update | 0.08 ms | 0.15 ms |
 | LiDAR scan → sectors + clusters | 0.69 ms | 1.25 ms |
 | A* detour plan (wall scenario) | 7.9 ms | 9.2 ms |
+| SLAM update (scan match + integrate) | 10.7 ms | 13.5 ms |
 
 The pipeline uses about 65% of the 40 ms budget at 25 FPS. The planner runs at 4 Hz on its own thread.
 
-### 8.5 Physical trials (to be recorded on the robot)
+### 8.5 SLAM and end-to-end link (fake-Pi bench, real UDP protocol)
+
+The real `app.py` was run against a scratch fake Pi that speaks the real UDP protocol. It sends 15 FPS video, scans of a 6 × 4 m room with furniture and a walking person, and odometry integrated from the velocity commands it receives (closed loop). The odometry was given 0.02 rad/s of yaw drift.
+
+| Check | Result |
+|---|---|
+| Teleop curve, ~6 s at 0.15 m/s and 0.30 rad/s | Odometry yaw error 17.6°; **SLAM error 2 cm, 1.1°** (match score 0.98) |
+| Fake Pi restarted (odometry jumps) | Map reset detected (`resets` 1) |
+| Pi killed | `VIDEO_LOST` within 0.8 s, robot stopped |
+| Pi restarted without a camera | Placeholder frames rejected; `VIDEO_LOST` stays set |
+| Camera back | `VIDEO_RESTORED`, pose at 14.9 FPS |
+| Settings API | In-range values applied live; speed 5 m/s, a bad IP and `STATE_IDLE` rejected with reasons |
+
+### 8.6 Physical trials (to be recorded on the robot)
 
 | Trial | Metric | Result |
 |---|---|---|
@@ -408,9 +463,10 @@ The pipeline uses about 65% of the 40 ms budget at 25 FPS. The planner runs at 4
 ## 10. Limitations and Future Work
 
 - **Monocular range:** the anthropometric constants assume an adult of average build. LiDAR fusion corrects this online, but camera-only operation (LiDAR blocked) is about 40% less accurate (§8.2).
-- **Single pose per frame:** MediaPipe is configured with `num_poses=1`, so only one person yields a candidate per frame. The HOG detector is initialised but does not currently add candidates. Running several poses, or a HOG/YOLO detector feeding Re-ID, would make bystander rejection and ambiguity detection effective in crowds.
+- **People per frame:** MediaPipe now returns up to `MAX_POSES` = 3 people, so bystander rejection and ambiguity detection operate on real multi-person scenes. The HOG detector is initialised but still does not add candidates.
 - **Colour-based Re-ID:** H–S histograms fail when two people wear similar clothing; this is detected as ambiguous, but not resolved. A learned embedding (for example OSNet) would separate them.
-- **Unused code:** `laptop/pose_tracker.py` is a legacy single-person tracker that the pipeline no longer imports. It references `Config` keys that no longer exist and can be removed.
+- **Calibration:** the camera pose (`CAM_*`) defaults are estimates for a Burger; measure them on the robot and save them from the dashboard (§4.10).
+- **SLAM scope:** the laptop matcher is scan-to-map, with no loop closure. For large spaces, run slam_toolbox on the Pi (`SLAM=1`).
 - **Physical validation:** §8.5 still has to be recorded on the robot.
 
 ---

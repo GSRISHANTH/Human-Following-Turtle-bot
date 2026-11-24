@@ -25,7 +25,7 @@ An end-to-end intelligent human-following mobile robot using a **distributed arc
 ```
                     ┌──────────────────────────────────────────────┐
                     │      Raspberry Pi 4 (Mounted on TurtleBot)   │
-                    │   IP: 10.252.159.140  |  User: ubuntu        │
+                    │   IP: 10.242.147.140  |  User: ubuntu        │
                     ├──────────────────────────────────────────────┤
                     │ • Hardware Camera Capture (640x480 @ 25 FPS) │
                     │ • UDP video sender (no server, no HTTP)      │
@@ -84,7 +84,7 @@ Open PowerShell in this project folder.
 
 ### B. On the Raspberry Pi (Robot Side)
 ```bash
-ssh ubuntu@10.252.159.140
+ssh ubuntu@10.242.147.140
 # password: turtlebot
 ```
 
@@ -111,17 +111,17 @@ Both your laptop and the Raspberry Pi must be connected to the exact same Wi-Fi 
   ```bash
   hostname -I
   ```
-  *(Example output: `10.252.159.140`)*
+  *(Example output: `10.242.147.140`)*
 - **Option 2 (From Laptop PowerShell)**:
   ```powershell
-  arp -a | Select-String "10.252.159"
+  arp -a | Select-String "10.242.147"
   ```
 
 ### Step 3: Set the IP in `laptop/config.py`
-`PI_IP` defaults to `10.252.159.140`. Change it there, or set it only for one run:
+`PI_IP` defaults to `10.242.147.140`. Change it there, or set it only for one run:
 
 ```powershell
-$env:PI_IP = "10.252.159.140"
+$env:PI_IP = "10.242.147.140"
 python app.py
 ```
 
@@ -141,7 +141,7 @@ python app.py
 Laptop (Python 3.10 - 3.14; tested on 3.14.6):
 ```powershell
 py -3.14 -m pip install -r requirements.txt
-py -3.14 -m unittest discover tests     # expect: Ran 106 tests ... OK
+py -3.14 -m unittest discover tests     # expect: Ran 128 tests ... OK
 ```
 Raspberry Pi (ROS 2 Humble supplies rclpy and the message packages):
 ```bash
@@ -157,7 +157,7 @@ python3 -m pip install --user -r ~/pi/requirements.txt
 ### Step 1: Start the Raspberry Pi Services
 Open a terminal on your laptop and SSH into the Pi:
 ```bash
-ssh ubuntu@10.252.159.140
+ssh ubuntu@10.242.147.140
 ```
 *(Enter password `turtlebot`)*
 
@@ -187,7 +187,7 @@ You will see:
 ```text
 [CVPipeline] MediaPipe Pose ready.
 [CVPipeline] OpenCV HOG multi-person detector ready.
-Connecting to Raspberry Pi stream at: http://10.252.159.140:5000/video_feed
+Connecting to Raspberry Pi stream at: http://10.242.147.140:5000/video_feed
 Opening Web Dashboard on: http://localhost:8000
 ```
 
@@ -289,7 +289,7 @@ If you want to manually drive the TurtleBot:
 - **Fix**:
   1. Test network connectivity from PowerShell:
      ```powershell
-     ping 10.252.159.140
+     ping 10.242.147.140
      ```
      On the Pi, `tail ~/pi_node.log` should show `Video peer: <laptop>:5000`.
   2. If it fails, check if the Pi's Wi-Fi IP changed (`hostname -I` on Pi) and update `PI_IP` in [`config.py`](file:///c:/Studies/7th%20sem/Embedded%20Systems/for%20Robotics/Project/human-following-laptop/config.py).
@@ -368,3 +368,54 @@ python test_system.py
 ### Tuning on the real robot
 
 `python tests/hw_follow_virtual.py [--gains=current,snappier-turn,...]` runs the real EKF and PID against a virtual person that walks, turns toward the roomier side and stops, while the real wheels, odometry and network latency close the loop. It needs about 2.5 m clear ahead and 0.5 m behind, and aborts if the LiDAR sees anything within 0.55 m ahead. It prints range and bearing error, end distance, peak speeds and turn activity per gain set, then the best one.
+
+---
+
+## 8. Configuration, SLAM and Co-Mapping
+
+### Nothing is hard-coded
+Every setting in `laptop/config.py` can be overridden without editing code, in this order:
+1. `config.local.json` in the project root (copy `config.example.json`; git ignores the local file).
+2. Environment variables `HF_<NAME>`, e.g. `$env:HF_DESIRED_DISTANCE = "1.0"`. `PI_IP` and `VIDEO_PORT` also work bare.
+
+The dashboard's **LIVE SETTINGS** card changes follow distance, speed limits, PID gains, camera pose, Re-ID thresholds and the Pi IP while the robot runs. Every value is range-checked. **APPLY & SAVE** writes the accepted values to `config.local.json`.
+
+### SLAM: three pose sources, best first
+| Source | When | How |
+|---|---|---|
+| `slam` | `SLAM=1 bash start_robot.sh` on the Pi with `ros-humble-slam-toolbox` installed | slam_toolbox publishes TF `map -> odom`. The Pi node (`--slam`) sends `map -> base_footprint` and the laptop uses it as is. |
+| `odom` | default: `/odom` from OpenCR | The laptop's scan matcher corrects wheel-odometry drift every scan. |
+| `scan` | no `/odom` at all | Scan matching alone, Hector-style, with a constant-velocity prior. |
+
+The laptop matcher (`laptop/lidar.py`) runs in three stages:
+1. A likelihood field `exp(-d²/2σ²)` built from the occupancy grid.
+2. A multi-resolution correlative search over ±0.30 m and ±15° (Olson's M3RSM pyramid).
+3. Gauss-Newton sub-cell refinement.
+
+It takes about 11 ms per scan. People and moving objects are kept out of the map, and the 12 m grid shifts as the robot drives so it never runs off the edge. The map panel shows which source is active and the match score.
+
+### LiDAR ↔ camera co-mapping
+`laptop/fusion.py` projects every LiDAR beam into the camera image using the camera pose in the config (`CAM_X_M`, `CAM_HEIGHT_M`, `LIDAR_HEIGHT_M`, `CAM_YAW_DEG`, `CAM_PITCH_DEG`) plus the yaw bias the system learns online:
+- **Overlay:** the live view draws the beams as a "laser curtain" coloured by range, with the owner's beams in green.
+- **Per-person range:** each person's box is labelled `cam X m | lidar Y m | match Z%`.
+- **Association:** the LiDAR person cluster is only accepted if its bearing lies inside that person's image box.
+
+**To calibrate:** stand 2 m in front of the robot. Adjust `CAM_YAW_DEG` until your green LiDAR dots sit on your legs, and `CAM_HEIGHT_M`/`CAM_PITCH_DEG` until the curtain meets the floor-level objects it hits.
+
+### Dashboard panels
+- **State machine:** the live state is highlighted, with the reason it is there and how long it has been there.
+- **Control loop** (last 30 s, hover for values):
+  - range against the set distance and the stop/resume band;
+  - linear and angular velocity, commanded (dashed) against actual;
+  - owner match score against the threshold.
+- **Banners:** VIDEO LOST, STOP LATCHED and TWO LOOK-ALIKES appear over the video.
+
+### Safety behaviour (state machine rules)
+- **Who can command:** once an owner is enrolled, only the owner's gestures count. A bystander's FOLLOW ME, WAIT or RELEASE is ignored and logged. Anyone's STOP is honoured.
+- **STOP latches:** the robot stays stopped until the owner raises one hand or someone presses START.
+- **Look-alikes:** two people who match equally well make the robot hold still. It never searches or guesses.
+- **Lost video:** if the camera fails, the Pi says it has no camera, or the link drops, perception stops and the robot halts. The offline test pattern is never treated as a camera frame.
+- **Saved profile:** a profile from an earlier run is loaded, but the robot does not move until FOLLOW ME or START.
+
+### HIL bench now includes LiDAR
+`run_hil.bat` simulates an LDS-02 scan of a 6 × 4 m furnished room (`hil/world.py`) at 10 Hz with the plant's odometry, so the map, SLAM and co-mapping all run without the robot.
