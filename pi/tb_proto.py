@@ -87,11 +87,16 @@ def pack_status(status, capture_time):
     return _HDR.pack(MAGIC, T_STATUS, 0, 0, 1, capture_time) + json.dumps(status).encode("utf-8")
 
 
-def pack_scan(bins_mm, pose, capture_time):
-    """bins_mm: SCAN_BINS ints (0 = none). pose: (x, y, yaw) or None."""
+POSE_NONE, POSE_ODOM, POSE_SLAM = 0, 1, 2   # pose flag in the scan packet (1 was the only value before)
+
+
+def pack_scan(bins_mm, pose, capture_time, pose_src=POSE_ODOM):
+    """bins_mm: SCAN_BINS ints (0 = none). pose: (x, y, yaw) or None.
+    pose_src: POSE_ODOM = /odom frame, POSE_SLAM = map frame from slam_toolbox / Cartographer (TF map->base)."""
     x, y, yaw = pose if pose is not None else (0.0, 0.0, 0.0)
     n = len(bins_mm)
-    body = _SCAN.pack(x, y, yaw, 1 if pose is not None else 0, n) + struct.pack(f"!{n}H", *bins_mm)
+    flag = POSE_NONE if pose is None else (POSE_SLAM if pose_src == POSE_SLAM else POSE_ODOM)
+    body = _SCAN.pack(x, y, yaw, flag, n) + struct.pack(f"!{n}H", *bins_mm)
     return _HDR.pack(MAGIC, T_SCAN, 0, 0, 1, capture_time) + body
 
 
@@ -128,7 +133,8 @@ class Reassembler:
             if n == 0 or len(body) < _SCAN.size + 2 * n:
                 return None
             bins = list(struct.unpack_from(f"!{n}H", body, _SCAN.size))
-            return "scan", {"bins": bins, "pose": (x, y, yaw) if has_odom else None}, ts
+            src = "slam" if has_odom == POSE_SLAM else "odom"
+            return "scan", {"bins": bins, "pose": (x, y, yaw) if has_odom else None, "pose_src": src}, ts
         if ptype != T_VIDEO or count == 0 or idx >= count:
             return None
 

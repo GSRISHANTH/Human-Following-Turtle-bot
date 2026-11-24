@@ -13,6 +13,7 @@ If no packet arrives for 0.35 s (CMD_TIMEOUT, about ten missed 30 Hz packets) th
     python3 pi_turtlebot_node.py --no-motors     camera and logging only
     python3 pi_turtlebot_node.py --raw-mjpeg     forward the camera's own MJPEG, no Pi re-encode
     python3 pi_turtlebot_node.py --test          spin the wheels briefly and exit
+    python3 pi_turtlebot_node.py --slam          send slam_toolbox's map-frame pose (TF map->base_footprint)
 """
 
 import glob
@@ -25,7 +26,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tb_proto
 
-os.environ["ROS_DOMAIN_ID"] = os.environ.get("ROS_DOMAIN_ID", "30")
+os.environ["ROS_DOMAIN_ID"] = os.environ.get("ROS_DOMAIN_ID", "30")   # must match the bringup's (this Pi's ~/.bashrc: 0)
+os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")                     # camera probing is expected to fail while unplugged
 os.environ["TURTLEBOT3_MODEL"] = os.environ.get("TURTLEBOT3_MODEL", "burger")
 os.environ["LDS_MODEL"] = os.environ.get("LDS_MODEL", "LDS-02")
 os.environ["ROS_LOCALHOST_ONLY"] = "0"
@@ -159,6 +161,54 @@ if ROS_MODE == 'ROS2':
         print("[Pi] Subscribed to /scan and /odom")
     except Exception as e:
         print(f"[Pi] LiDAR subscriptions failed: {e}")
+
+# --- Optional: map-frame pose from slam_toolbox / Cartographer (--slam). ---
+# Run alongside bringup:  ros2 launch slam_toolbox online_async_launch.py   (or turtlebot3_cartographer)
+# The node then sends TF map -> base_footprint instead of /odom, and the laptop uses it as is (no own matching).
+SLAM_POSE = "--slam" in sys.argv
+SLAM_BASE_FRAME = os.environ.get("SLAM_BASE_FRAME", "base_footprint")
+slam_pose = None
+slam_time = 0.0
+tf_buffer = None
+if ROS_MODE == 'ROS2' and SLAM_POSE:
+    try:
+        from tf2_ros import Buffer, TransformListener
+        tf_buffer = Buffer()
+        _tf_listener = TransformListener(tf_buffer, ros2_node)
+        print(f"[Pi] --slam: sending TF map -> {SLAM_BASE_FRAME} as the robot pose")
+    except Exception as e:
+        print(f"[Pi] --slam requested but tf2_ros is unavailable ({e}); sending /odom instead")
+        tf_buffer = None
+
+
+def _slam_poll():
+    """Look the map-frame pose up at 20 Hz. Missing TF (SLAM not started yet) just means /odom is sent."""
+    global slam_pose, slam_time
+    import math
+    from rclpy.time import Time
+    while True:
+        time.sleep(0.05)
+        try:
+            t = tf_buffer.lookup_transform('map', SLAM_BASE_FRAME, Time())
+        except Exception:
+            continue
+        q = t.transform.rotation
+        yaw = math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
+        pose = (t.transform.translation.x, t.transform.translation.y, yaw)
+        if all(math.isfinite(v) for v in pose):
+            with scan_lock:
+                slam_pose, slam_time = pose, time.monotonic()
+
+
+if tf_buffer is not None:
+    threading.Thread(target=_slam_poll, daemon=True).start()
+
+
+def robot_pose():
+    """(pose, source) for the scan packet. Caller holds scan_lock."""
+    if slam_pose is not None and time.monotonic() - slam_time < 1.0:
+        return slam_pose, tb_proto.POSE_SLAM
+    return odom_pose, tb_proto.POSE_ODOM
 
 torque_on = False
 
@@ -325,11 +375,28 @@ def current_peer():
 # ---------------------------------------------------------------------------
 # Camera
 # ---------------------------------------------------------------------------
+CAMERA_DEVICE = os.environ.get("CAMERA_DEVICE")   # e.g. /dev/video0 or 0; default: probe /dev/video0..9
+
+
+def _camera_candidates():
+    if CAMERA_DEVICE:
+        return [int(CAMERA_DEVICE) if CAMERA_DEVICE.isdigit() else CAMERA_DEVICE]
+    # /dev/video10 and up are the Pi's own codec/ISP nodes (bcm2835-codec, -isp): never a camera.
+    # No node yet = nothing plugged in: wait for one instead of probing (and logging) blind indices.
+    return sorted(glob.glob('/dev/video[0-9]'))
+
+
 class Camera:
-    """Keeps only the newest frame. Encoding happens in the sender, not here."""
+    """Keeps only the newest frame. Encoding happens in the sender, not here.
+    Self-healing: a camera that is missing at start, or unplugged while running, is retried every 2 s, and
+    `cap` is None (status camera=False) whenever no frames are actually arriving."""
+
+    REOPEN_SEC = 2.0
+    STALL_SEC = 2.0
 
     def __init__(self):
         self.cap = None
+        self.device = None
         self.raw = False
         self.latest = None      # ndarray, or bytes when raw
         self.frame_no = 0
@@ -337,74 +404,79 @@ class Camera:
         self.running = True
         self.capture_fps = 0.0
         self._open()
-        if self.cap is not None:
-            threading.Thread(target=self._loop, daemon=True).start()
-        else:
-            print("[Pi] Using synthetic camera test pattern generator.")
-            threading.Thread(target=self._synth_loop, daemon=True).start()
+        threading.Thread(target=self._run, daemon=True).start()
 
-    def _synth_loop(self):
-        import numpy as np
+    def _configure(self, cap):
         import cv2
-        n, t0 = 0, time.monotonic()
-        while self.running:
-            time.sleep(1.0 / max(1, TARGET_FPS))
-            frame = np.zeros((FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
-            cv2.putText(frame, f"SYNTHETIC PI FEED {time.strftime('%H:%M:%S')}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            with self.cond:
-                self.latest = frame
-                self.frame_no += 1
-                self.cond.notify_all()
-            n += 1
-            now = time.monotonic()
-            if now - t0 >= 1.0:
-                self.capture_fps = n / (now - t0)
-                n, t0 = 0, now
-
-    def _open(self):
-        import cv2
-        cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_V4L2)
-        if not cap.isOpened():
-            cap = cv2.VideoCapture(CAMERA_INDEX)
-        if not cap.isOpened():
-            for alt in (1, 2):
-                cap = cv2.VideoCapture(alt)
-                if cap.isOpened():
-                    break
-        if not cap.isOpened():
-            print("[Pi] Camera not detected.")
-            return
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
         cap.set(cv2.CAP_PROP_FPS, TARGET_FPS)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        if RAW_MJPEG:
-            cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
-            ok, frame = cap.read()
-            if ok and frame is not None and frame.size > 4 and bytes(frame.reshape(-1)[:2]) == b"\xff\xd8":
-                self.raw = True
-                print("[Pi] Raw MJPEG passthrough: the Pi does not decode or re-encode.")
-            else:
-                print("[Pi] Camera gave no raw MJPEG; falling back to re-encode.")
-                cap.release()
-                cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_V4L2)
-                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        self.cap = cap
-        print(f"[Pi] Camera open ({int(cap.get(3))}x{int(cap.get(4))}).")
 
-    def _loop(self):
+    def _open(self):
+        import cv2
+        for dev in _camera_candidates():
+            cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
+            if not cap.isOpened():
+                cap.release()
+                continue
+            self._configure(cap)
+            ok, frame = cap.read()          # a node that opens but never delivers a frame is not a camera
+            if not ok or frame is None:
+                cap.release()
+                continue
+            self.raw = False
+            if RAW_MJPEG:
+                cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
+                ok, frame = cap.read()
+                if ok and frame is not None and frame.size > 4 and bytes(frame.reshape(-1)[:2]) == bytes((0xFF, 0xD8)):
+                    self.raw = True
+                    print("[Pi] Raw MJPEG passthrough: the Pi does not decode or re-encode.")
+                else:
+                    print("[Pi] Camera gave no raw MJPEG; falling back to re-encode.")
+                    cap.release()
+                    cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
+                    self._configure(cap)
+            self.cap, self.device = cap, dev
+            print(f"[Pi] Camera open on {dev} ({int(cap.get(3))}x{int(cap.get(4))}).")
+            return True
+        return False
+
+    def _close(self):
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+        self.cap = None
+
+    def _run(self):
         n, t0 = 0, time.monotonic()
+        last_frame = time.monotonic()
+        warned = False
         while self.running:
+            if self.cap is None:
+                if not warned:
+                    print("[Pi] No camera. Retrying every 2 s (plug a USB camera in, or set CAMERA_DEVICE).")
+                    warned = True
+                time.sleep(self.REOPEN_SEC)
+                if self._open():
+                    warned = False
+                    last_frame = time.monotonic()
+                continue
             if not self.cap.grab():
-                time.sleep(0.004)
+                if time.monotonic() - last_frame > self.STALL_SEC:
+                    print(f"[Pi] Camera {self.device} stopped delivering frames; reopening.")
+                    self._close()
+                    self.capture_fps = 0.0
+                else:
+                    time.sleep(0.01)
                 continue
             ok, frame = self.cap.retrieve()
             if not ok or frame is None:
                 continue
+            last_frame = time.monotonic()
             item = bytes(frame.reshape(-1)) if self.raw else frame
             with self.cond:
                 self.latest = item
@@ -479,6 +551,7 @@ def sender_loop(camera):
                 "raw": camera.raw, "cmd_age": None if cmd_age is None else round(cmd_age, 2),
                 "cmds": cmd_count, "lin": lin, "ang": ang,
                 "scan_hz": round(scan_hz, 1) if scan_time and now - scan_time < 1.0 else 0.0,
+                "slam": bool(slam_pose is not None and now - slam_time < 1.0),
             }
             try:
                 sock.sendto(tb_proto.pack_status(status, time.time()), dest)
@@ -488,11 +561,12 @@ def sender_loop(camera):
         if dest is not None:
             with scan_lock:
                 fresh = scan_bins is not None and scan_time > last_scan_sent
-                bins, pose, stamp = scan_bins, odom_pose, scan_time
+                bins, stamp = scan_bins, scan_time
+                pose, pose_src = robot_pose()
             if fresh:
                 last_scan_sent = stamp
                 try:
-                    sock.sendto(tb_proto.pack_scan(bins, pose, time.time()), dest)
+                    sock.sendto(tb_proto.pack_scan(bins, pose, time.time(), pose_src), dest)
                 except OSError:
                     pass
 

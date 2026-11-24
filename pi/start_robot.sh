@@ -36,5 +36,21 @@ fi
 # The node lives next to this script (the pi/ folder), wherever it was copied.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo "[TurtleBot] Starting AI Companion Bridge (Camera + /cmd_vel)..."
-exec python3 -u "$SCRIPT_DIR/pi_turtlebot_node.py"
+# 4. Optional real SLAM on the Pi:  SLAM=1 bash start_robot.sh
+#    slam_toolbox (sudo apt install ros-humble-slam-toolbox) publishes TF map->odom; the node then sends the
+#    map-frame pose and the laptop uses it instead of its own scan matcher.
+NODE_ARGS=""
+if [ "${SLAM:-0}" = "1" ]; then
+    if ros2 pkg prefix slam_toolbox > /dev/null 2>&1; then
+        if ! pgrep -f "async_slam_toolbox_node" > /dev/null; then
+            echo "[TurtleBot] Starting slam_toolbox (online async)..."
+            ros2 launch slam_toolbox online_async_launch.py use_sim_time:=false &
+            sleep 3
+        fi
+        NODE_ARGS="--slam"
+    else
+        echo "[TurtleBot] SLAM=1 but slam_toolbox is not installed; the laptop's own scan matcher will be used."
+    fi
+fi
+exec python3 -u "$SCRIPT_DIR/pi_turtlebot_node.py" $NODE_ARGS
 
