@@ -138,4 +138,5 @@ class PersonEKF:
         r, b = self.range_bearing()
         return {"x": float(self.s[0]), "y": float(self.s[1]), "vx": float(self.s[2]), "vy": float(self.s[3]),
                 "range": float(r), "bearing_deg": math.degrees(b), "speed": math.hypot(self.s[2], self.s[3]),
-                "misses": self.misses, "nis": self.nis}
+                "misses": self.misses, "nis": self.nis,
+                "cov": [float(self.P[0, 0]), float(self.P[0, 1]), float(self.P[1, 1])]}

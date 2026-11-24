@@ -27,7 +27,7 @@ from config import Config  # noqa: E402
 from ekf_person import PersonEKF  # noqa: E402
 from follow_controller import FollowController  # noqa: E402
 
-PI = "10.252.159.140"
+PI = Config.PI_IP          # config.local.json / PI_IP env, never hard-coded
 args = [a for a in sys.argv[1:] if not a.startswith("--")]
 if args:
     PI = args[0]

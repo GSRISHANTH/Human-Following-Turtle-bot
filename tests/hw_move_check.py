@@ -21,7 +21,7 @@ import numpy as np  # noqa: E402
 import tb_proto  # noqa: E402
 import lidar  # noqa: E402
 
-PI = sys.argv[1] if len(sys.argv) > 1 else "10.252.159.140"
+PI = sys.argv[1] if len(sys.argv) > 1 else __import__("config").Config.PI_IP
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind(("0.0.0.0", tb_proto.VIDEO_PORT))

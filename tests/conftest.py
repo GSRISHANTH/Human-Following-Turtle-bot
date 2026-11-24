@@ -6,8 +6,12 @@ keeps the slew limiting and watchdog but transmits nothing. The one test that ne
 test) switches itself to udp and points at 127.0.0.1.
 """
 
+import os
 import sys
 from pathlib import Path
+
+# A developer's config.local.json / HF_* variables must not change what the tests see.
+os.environ["HF_NO_OVERRIDES"] = "1"
 
 ROOT = Path(__file__).resolve().parents[1]
 for p in (ROOT, ROOT / "pi", ROOT / "laptop"):

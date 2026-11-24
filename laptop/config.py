@@ -1,8 +1,15 @@
 """
 Configuration settings for Robust Owner-Locked Human-Following TurtleBot System.
 Centralizes all perception, Re-ID, state-machine, control, safety, and network parameters.
+
+Nothing here has to be edited in place. Every UPPER_CASE value can be overridden, in this order:
+  1. config.local.json in the project root   {"PI_IP": "192.168.1.42", "CAM_HEIGHT_M": 0.21}
+  2. environment variables HF_<NAME>          $env:HF_DESIRED_DISTANCE = "1.0"
+  (PI_IP and VIDEO_PORT also accept their bare names, as before.)
+The dashboard's settings panel writes the tunable subset (TUNABLE below) back to config.local.json.
 """
 
+import json
 import os
 
 # Project root stays the folder that holds the pose model, templates, and static files.
@@ -13,7 +20,7 @@ class Config:
     # Override with PI_IP=127.0.0.1 when running the HIL bench (hil/run_hil.py).
     # The Pi hosts nothing. The laptop listens on VIDEO_PORT (UDP) for video and
     # sends commands plus a HELLO to PI_IP:UDP_PORT so the Pi knows where to reply.
-    PI_IP = os.environ.get("PI_IP", "10.252.159.140")
+    PI_IP = os.environ.get("PI_IP", "10.242.147.140")
     VIDEO_PORT = int(os.environ.get("VIDEO_PORT", "5000"))
 
     @classmethod
@@ -74,6 +81,23 @@ class Config:
 
     # --- Camera geometry and LiDAR fusion ---
     CAMERA_HFOV_DEG = 57.0        # horizontal field of view; focal length in px = (w/2)/tan(hfov/2)
+    # Camera pose relative to the LiDAR centre (robot frame: x forward, y left, z up). Used to project the
+    # LiDAR scan into the image (co-mapping) and to pick the LiDAR beams that fall inside a person's box.
+    CAM_X_M = 0.04                # camera ahead of the LiDAR axis
+    CAM_Y_M = 0.0
+    CAM_HEIGHT_M = 0.20           # camera optical centre above the floor
+    LIDAR_HEIGHT_M = 0.17         # LDS-02 scan plane above the floor (Burger top plate)
+    CAM_YAW_DEG = 0.0             # + = camera looks to the left of the robot axis
+    CAM_PITCH_DEG = 0.0           # + = camera tilted down
+
+    # Monocular range: real body sizes (m). Range = f_px * size / pixels * DISTANCE_SCALE.
+    # With the 57 deg HFOV these give the same ranges as the earlier px*m constants (235, 160, 230, 320 at 640 px).
+    PERSON_SHOULDER_M = 0.40
+    PERSON_HIP_M = 0.27
+    PERSON_TORSO_M = 0.39
+    PERSON_BOX_M = 0.54           # fallback: landmark bounding-box height
+    DISTANCE_SCALE = 1.0          # dashboard calibration; the LiDAR also corrects it online (vision_scale)
+    MAX_POSES = 3                 # people MediaPipe returns per frame; >1 is what makes bystander rejection real
     LIDAR_FUSION = True
     LIDAR_HARD_STOP_M = 0.20      # anything this close dead ahead stops forward motion, whatever the vision says
     LIDAR_STALE_SEC = 0.6         # older scans are ignored and the vision corridors take over
@@ -127,3 +151,101 @@ class Config:
     UDP_PORT = 8888
     COMMAND_HZ = 30
     TELEMETRY_HZ = 20
+
+    # --- SLAM (laptop occupancy grid + multi-resolution correlative scan matching) ---
+    SLAM_SEARCH_XY_M = 0.30       # translation search window around the motion prior
+    SLAM_SEARCH_YAW_DEG = 15.0    # rotation search window
+    SLAM_SIGMA_M = 0.06           # likelihood-field width: how far a return may sit from a wall and still count
+    SLAM_MIN_SCORE = 0.35         # below this the match is ignored and odometry (or the prior) is kept
+    SLAM_RECENTER_M = 2.5         # shift the 12 m grid once the robot is this close to its edge
+    SLAM_USE_EXTERNAL = True      # trust a map-frame pose from slam_toolbox/Cartographer when the Pi sends one
+
+    # Settings the dashboard may change live (and save to config.local.json).
+    TUNABLE = ("DESIRED_DISTANCE", "DISTANCE_SCALE", "CAMERA_HFOV_DEG", "CAM_X_M", "CAM_Y_M", "CAM_HEIGHT_M",
+               "LIDAR_HEIGHT_M", "CAM_YAW_DEG", "CAM_PITCH_DEG", "MAX_LINEAR_VEL", "MAX_ANGULAR_VEL",
+               "PID_DIST_KP", "PID_DIST_KI", "PID_DIST_KD", "PID_TURN_KP", "PID_TURN_KI", "PID_TURN_KD",
+               "PID_FF_GAIN", "IDENTITY_MATCH_THRESHOLD", "REACQ_THRESHOLD", "PI_IP")
+
+    @classmethod
+    def coerce(cls, name, value):
+        """Convert a JSON/env value to the type of the existing setting. Raises ValueError/KeyError."""
+        old = getattr(cls, name)
+        if isinstance(old, bool):
+            if isinstance(value, str):
+                return value.strip().lower() in ("1", "true", "yes", "on")
+            return bool(value)
+        if isinstance(old, int):
+            return int(float(value))
+        if isinstance(old, float):
+            v = float(value)
+            if v != v or v in (float("inf"), float("-inf")):
+                raise ValueError(f"{name}: not a finite number")
+            return v
+        if isinstance(old, str):
+            return str(value).strip()
+        raise KeyError(name)
+
+    @classmethod
+    def set(cls, name, value):
+        name = name.upper()
+        if not name.isupper() or name.startswith("STATE_") or not hasattr(cls, name) or name == "TUNABLE":
+            raise KeyError(name)
+        setattr(cls, name, cls.coerce(name, value))
+        if name == "DESIRED_DISTANCE":
+            cls.TARGET_DISTANCE = cls.DESIRED_DISTANCE
+        return getattr(cls, name)
+
+    @classmethod
+    def tunables(cls):
+        return {k: getattr(cls, k) for k in cls.TUNABLE}
+
+    @classmethod
+    def save_local(cls, updates, path=None):
+        """Merge updates into config.local.json so the next start uses them."""
+        path = path or LOCAL_CONFIG_PATH
+        data = {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = {}
+        data.update(updates)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+        os.replace(tmp, path)
+
+
+LOCAL_CONFIG_PATH = os.environ.get("HF_CONFIG", os.path.join(PROJECT_ROOT, "config.local.json"))
+
+
+def apply_overrides(env=None, path=None):
+    """config.local.json first, then HF_<NAME> environment variables. Bad entries are reported, never fatal."""
+    env = os.environ if env is None else env
+    applied = {}
+    path = path or LOCAL_CONFIG_PATH
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for k, v in json.load(f).items():
+                    try:
+                        applied[k.upper()] = Config.set(k, v)
+                    except (KeyError, ValueError, TypeError) as e:
+                        print(f"[Config] ignoring {k!r} in {path}: {e}")
+        except (OSError, ValueError) as e:
+            print(f"[Config] cannot read {path}: {e}")
+    for key, raw in env.items():
+        if key.startswith("HF_") and key != "HF_CONFIG":
+            try:
+                applied[key[3:]] = Config.set(key[3:], raw)
+            except (KeyError, ValueError, TypeError) as e:
+                print(f"[Config] ignoring {key}: {e}")
+    if "PI_IP" in env:                # the long-standing bare names still win
+        Config.PI_IP = env["PI_IP"].strip()
+    if "VIDEO_PORT" in env:
+        Config.VIDEO_PORT = int(env["VIDEO_PORT"])
+    return applied
+
+
+if os.environ.get("HF_NO_OVERRIDES") != "1":
+    apply_overrides()

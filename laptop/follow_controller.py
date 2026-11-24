@@ -49,6 +49,9 @@ class FollowController:
         """Returns (v, w). bearing in rad, rates in per-second units."""
         desired = Config.DESIRED_DISTANCE if desired is None else desired
         dt = max(1e-3, min(0.3, dt))
+        # gains are read live so the dashboard can tune them while following
+        self.dist.kp, self.dist.ki, self.dist.kd = Config.PID_DIST_KP, Config.PID_DIST_KI, Config.PID_DIST_KD
+        self.turn.kp, self.turn.ki, self.turn.kd = Config.PID_TURN_KP, Config.PID_TURN_KI, Config.PID_TURN_KD
 
         # steering first: it also gates the forward speed
         w = self.turn.step(bearing, bearing_rate, dt, -Config.MAX_ANGULAR_VEL, Config.MAX_ANGULAR_VEL)

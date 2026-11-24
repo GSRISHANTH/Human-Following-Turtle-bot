@@ -18,9 +18,13 @@ class GestureRecognizer:
         Analyzes 33 MediaPipe pose landmarks to detect commands.
         Returns: active_gesture (str), is_new_event (bool)
         """
+        return self.feed(self.classify(landmarks))
+
+    @staticmethod
+    def classify(landmarks):
+        """One frame, no memory: which gesture these landmarks show ('NONE' if none)."""
         if not landmarks or len(landmarks) < 25:
-            self._reset_candidate()
-            return "NONE", False
+            return "NONE"
 
         # Key Landmarks
         nose = landmarks[0]
@@ -71,7 +75,10 @@ class GestureRecognizer:
                 elif wr_l_vis and el_l_vis and (wr_l.y >= nose.y - 0.04) and (wr_l.y < sh_l.y + 0.05) and (wr_l.y < el_l.y):
                     detected = "WAIT"
 
-        # Debounce to prevent false triggers from noisy frames
+        return detected
+
+    def feed(self, detected):
+        """Debounce: a gesture fires once after debounce_frames identical frames, and again only after a break."""
         is_new_event = False
         if detected != "NONE":
             if detected == self.current_candidate:

@@ -48,3 +48,7 @@ owner_profile.pkl
 Thumbs.db
 ehthumbs.db
 
+
+# Local settings written by the dashboard (Save) or by hand; see config.example.json
+config.local.json
+config.local.json.tmp

@@ -25,6 +25,7 @@ from safety_monitor import SafetyMonitor
 from robot_controller import RobotController
 from obstacle_avoidance import ObstacleAvoidance
 import lidar as lidar_lib
+import fusion
 from ekf_person import PersonEKF
 from follow_controller import FollowController
 
@@ -34,7 +35,8 @@ class CVPipeline:
         
         # Subsystems
         self.appearance = AppearanceModel(h_bins=18, s_bins=16)
-        self.gestures = GestureRecognizer(debounce_frames=4)
+        self.gestures = GestureRecognizer(debounce_frames=Config.GESTURE_CONFIRM_FRAMES)
+        self.any_stop = GestureRecognizer(debounce_frames=Config.GESTURE_CONFIRM_FRAMES)  # STOP_HALT from anyone
         self.safety = SafetyMonitor(min_safe_dist=0.55, caution_dist=0.85)
         self.robot = RobotController()
         self.nav = ObstacleAvoidance()
@@ -66,6 +68,10 @@ class CVPipeline:
         self.search_scan_rot = 0.0
         self.search_dir = 1.0
         self.memory_done = False      # the drive to the last-seen position is over (arrived, blocked, or timed out)
+        self.safety_latched = False   # STOP_HALT seen: stays stopped until FOLLOW_ME (owner) or START from the dashboard
+        self.ambiguous = False        # two look-alikes in view: hold still, never guess and never search
+        self.render_hud = True        # the dashboard draws in the browser; the worker turns the OpenCV HUD off
+        self.lidar_cam = []           # LiDAR beams projected into the image, for the co-mapped overlay
         self.search_t0 = None         # when the scan search began; it starts after the memory pursuit, not at the loss
         
         # Target Tracking State
@@ -87,13 +93,15 @@ class CVPipeline:
         self.owner_match_score = 1.0 if self.owner_enrolled else 0.0
         self.last_candidates = []
         if self.owner_enrolled:
+            # A profile from an earlier run is a convenience, not a command: never start driving on boot.
+            self.following_enabled = False
             self.target_state = Config.STATE_OWNER_LOCKED
             print("[CVPipeline] Loaded designated Owner biometric profile.")
         
         # Dynamic distance parameters
         self.base_target_distance = Config.DESIRED_DISTANCE
         self.dynamic_target_distance = self.base_target_distance
-        self.distance_calibration = 210.0
+        self.distance_calibration = Config.DISTANCE_SCALE   # kept for the dashboard; the value used is Config.DISTANCE_SCALE
         
         # Smoothing filters for target
         self.smooth_distance = None
@@ -107,6 +115,8 @@ class CVPipeline:
         # Event Log (keeps last 50 events)
         self.event_log = []
         self._log_event("SYSTEM_INIT", "CV Pipeline initialized with Multi-Person Disambiguation & Re-ID")
+        if self.owner_enrolled:
+            self._log_event("PROFILE_LOADED", "Saved owner profile restored. Robot is stationary: raise a hand (FOLLOW ME) or press START.")
 
         # Initialize MediaPipe PoseLandmarker and OpenCV HOG
         self.landmarker = None
@@ -137,7 +147,7 @@ class CVPipeline:
                 options = PoseLandmarkerOptions(
                     base_options=BaseOptions(model_asset_path=self.model_path),
                     running_mode=VisionRunningMode.VIDEO,
-                    num_poses=1,
+                    num_poses=max(1, int(Config.MAX_POSES)),
                     min_pose_detection_confidence=0.5,
                     min_pose_presence_confidence=0.5,
                     min_tracking_confidence=0.5
@@ -171,7 +181,7 @@ class CVPipeline:
         """Explicitly locks onto a designated individual"""
         self.target_id = person_id
         self.target_signature = signature
-        self.target_state = "TRACKING"
+        self.target_state = Config.STATE_OWNER_LOCKED
         self.target_kalman = PersonKalmanTracker(bbox)
         self.target_lost_time = 0.0
         hex_code = signature.get("color_hex", "#ffffff") if signature else "#ffffff"
@@ -182,11 +192,11 @@ class CVPipeline:
         prev_id = self.target_id
         self.target_id = None
         self.target_signature = None
-        self.target_state = "SEARCHING"
+        self.target_state = Config.STATE_OWNER_LOCKED if self.owner_enrolled else Config.STATE_IDLE
         self.target_kalman = None
         self.smooth_distance = None
         self.smooth_offset_x = None
-        self._log_event("TARGET_RELEASED", f"Target ID #{prev_id} released. System in SEARCHING mode.")
+        self._log_event("TARGET_RELEASED", f"Target ID #{prev_id} released.")
 
     def enroll_owner(self, cand=None):
         """Enrolls the specified or primary candidate as the exclusive Owner to recognize & follow"""
@@ -203,6 +213,8 @@ class CVPipeline:
         self.owner_profile = self.appearance.create_owner_profile(cand["signature"], owner_id=cand.get("id", 1))
         self.owner_enrolled = True
         self.following_enabled = True
+        self.safety_latched = False
+        self.ambiguous = False
         self.owner_match_score = 1.0
         self.own_score = 0.7
         self.last_cam_seen = time.time()
@@ -224,6 +236,9 @@ class CVPipeline:
         self.target_id = None
         self.target_signature = None
         self.target_kalman = None
+        self.ekf.reset()
+        self.target_lost_time = None
+        self.lidar_only = False
         self.target_state = Config.STATE_OWNER_RELEASED
         self.robot.update_auto_commands(0.0, 0.0, can_move=False)
         if os.path.exists(self.owner_profile_file):
@@ -239,11 +254,24 @@ class CVPipeline:
         return self.release_owner()
 
     def start_following(self):
-        """Starts / resumes autonomous following of the locked owner"""
+        """Starts / resumes autonomous following of the locked owner. Also the only way out of a STOP latch."""
+        if self.safety_latched:
+            self._log_event("SAFETY_CLEARED", "Stop latch cleared. Following may resume.")
+        self.safety_latched = False
         self.following_enabled = True
         if self.owner_enrolled:
             self.target_state = Config.STATE_FOLLOWING
         self._log_event("FOLLOWING_STARTED", "Autonomous following enabled by operator.")
+        return True
+
+    def trigger_safety_stop(self, reason="Safety stop."):
+        """Latched stop: following is disabled until start_following() (FOLLOW_ME by the owner, or START)."""
+        if not self.safety_latched:
+            self._log_event("EMERGENCY_STOP", reason)
+        self.safety_latched = True
+        self.following_enabled = False
+        self.target_state = Config.STATE_SAFETY_STOP
+        self.robot.update_auto_commands(0.0, 0.0, can_move=False)
         return True
 
     def pause_following(self):
@@ -494,7 +522,12 @@ class CVPipeline:
         lidar_r = lidar_b = None
         if self._lidar_fresh():
             near = self.ekf.range_bearing()[0] if self.ekf.active else vis_d
-            pc = lidar_lib.person_cluster(self.lidar_clusters, bearing_cam, near)
+            # only LiDAR clusters whose bearing lies inside the person's box (co-mapping), not a fixed window
+            x1, _, x2, _ = cand["bbox"]
+            box_half_deg = math.degrees(math.atan(0.5 * (x2 - x1) / f_px))
+            pc = lidar_lib.person_cluster(self.lidar_clusters, bearing_cam, near,
+                                          window_deg=max(4.0, min(20.0, box_half_deg + 2.0)))
+            self._owner_beams = pc["idx"] if pc is not None else None
             if pc is not None:
                 lidar_r, lidar_b = pc["range"], pc["bearing"]
                 if abs(lidar_r - vis_d) > Config.LIDAR_AGREE_FRAC * max(vis_d, lidar_r) and not self.ekf.active:
@@ -560,53 +593,13 @@ class CVPipeline:
             new_h = max(1, int(round(h * (480.0 / w))))
             frame = cv2.resize(frame, (480, new_h), interpolation=cv2.INTER_LINEAR)
             h, w = frame.shape[:2]
-        annotated = frame.copy()
+        annotated = frame.copy() if self.render_hud else frame
         now = time.time()
         t_meas = t_frame if t_frame else now   # when the frame reached the laptop, not when we finished with it
 
         # Step 1: Detect all person candidates in the scene
         candidates = self._detect_all_persons(frame, annotated)
         self.last_candidates = candidates
-
-        # Step 2: Pose & Gesture Analysis across detected candidates
-        active_gesture, is_new_gesture = "NONE", False
-        gesture_person = None
-        for c in candidates:
-            lm = c.get("landmarks")
-            if lm is not None:
-                g, is_new = self.gestures.analyze_pose(lm)
-                if g != "NONE":
-                    active_gesture = g
-                    is_new_gesture = is_new
-                    gesture_person = c
-                    break
-
-        # Handle Gesture commands (HRI - FollowMe Framework)
-        manual_stop_signal = False
-        if is_new_gesture:
-            self._log_event("GESTURE_DETECTED", f"Recognized user gesture: '{active_gesture}'")
-            if active_gesture == "FOLLOW_ME":
-                # If no owner is locked, enroll the person performing the gesture
-                if not self.owner_enrolled:
-                    target_to_enroll = gesture_person if gesture_person is not None else (candidates[0] if len(candidates) > 0 else None)
-                    if target_to_enroll is not None:
-                        self.enroll_owner(target_to_enroll)
-                else:
-                    # Owner is already locked -> Start/resume following
-                    self.start_following()
-            elif active_gesture == "WAIT":
-                # Pause following -> enter WAIT_FOR_OWNER_MOVEMENT
-                self.pause_following()
-            elif active_gesture == "RELEASE":
-                # Explicit release
-                self.release_owner()
-            elif active_gesture == "STOP_HALT":
-                manual_stop_signal = True
-                self.target_state = Config.STATE_SAFETY_STOP
-                self._log_event("EMERGENCY_STOP", "Robot halted by human STOP gesture command.")
-
-        if active_gesture == "STOP_HALT":
-            manual_stop_signal = True
 
         # Step 3: Multi-Person Disambiguation & Owner Recognition Matching
         matched_target = None
@@ -641,11 +634,16 @@ class CVPipeline:
             )
 
             if is_ambig and len(candidates) > 1:
+                if not self.ambiguous:
+                    self._log_event("TARGET_AMBIGUOUS", "Two people match the owner equally well. Holding still until they separate.")
+                self.ambiguous = True
                 self.target_state = Config.STATE_TARGET_AMBIGUOUS
                 matched_target = None
                 self.owner_match_score = 0.0
-                self._log_event("TARGET_AMBIGUOUS", "Ambiguous identity match detected among candidates. Robot stopped safely.")
             else:
+                if self.ambiguous:
+                    self._log_event("AMBIGUITY_RESOLVED", "Only one candidate matches the owner again.")
+                self.ambiguous = False
                 best_score = -1.0
                 best_cand = None
                 for cand in candidates:
@@ -699,6 +697,46 @@ class CVPipeline:
                 # Potential candidate ready for enrollment
                 matched_target = candidates[0]
 
+        # Step 3b: Gestures (FollowMe HRI). Once an owner is enrolled only the owner can command the robot:
+        # a bystander's raised hand or crossed arms is ignored. STOP_HALT is honoured from anyone in view.
+        labels = [self.gestures.classify(c.get("landmarks")) for c in candidates]
+        if self.owner_enrolled:
+            subject = matched_target if (matched_target is not None and matched_target.get("is_owner")) else None
+        else:
+            subject = next((c for c, g in zip(candidates, labels) if g == "FOLLOW_ME"), None)
+            if subject is None and candidates:
+                subject = max(candidates, key=lambda c: (c["bbox"][2] - c["bbox"][0]) * (c["bbox"][3] - c["bbox"][1]))
+        subj_i = next((i for i, c in enumerate(candidates) if c is subject), None)
+        active_gesture, is_new_gesture = self.gestures.feed(labels[subj_i] if subj_i is not None else "NONE")
+        stop_g, stop_new = self.any_stop.feed("STOP_HALT" if "STOP_HALT" in labels else "NONE")
+        if stop_new and not (is_new_gesture and active_gesture == "STOP_HALT"):
+            active_gesture, is_new_gesture = "STOP_HALT", True
+        elif stop_g == "STOP_HALT" and active_gesture == "NONE":
+            active_gesture = "STOP_HALT"
+        if self.owner_enrolled:
+            ignored = [g for i, g in enumerate(labels) if i != subj_i and g not in ("NONE", "STOP_HALT")]
+            if ignored and now - getattr(self, "_last_ignored_log", 0.0) > 3.0:
+                self._last_ignored_log = now
+                self._log_event("GESTURE_IGNORED", f"Bystander gesture '{ignored[0]}' ignored: only the owner can command the robot.")
+
+        if is_new_gesture:
+            self._log_event("GESTURE_DETECTED", f"Recognized user gesture: '{active_gesture}'")
+            if active_gesture == "FOLLOW_ME":
+                if not self.owner_enrolled:
+                    if subject is not None:
+                        self.enroll_owner(subject)
+                        matched_target = subject
+                else:
+                    self.start_following()
+            elif active_gesture == "WAIT":
+                self.pause_following()
+            elif active_gesture == "RELEASE":
+                self.release_owner()
+                matched_target = None
+            elif active_gesture == "STOP_HALT":
+                self.trigger_safety_stop("Robot halted by STOP gesture. Raise one hand (FOLLOW ME) or press START to resume.")
+        manual_stop_signal = self.safety_latched or active_gesture == "STOP_HALT"
+
         # Step 4: Lost-Human Trajectory Projection (Conservative stop, no blind rotation)
         projected_bbox = None
         if self.target_state == Config.STATE_TARGET_TEMPORARILY_LOST:
@@ -707,7 +745,8 @@ class CVPipeline:
             occlusion_duration = now - self.target_lost_time
             if occlusion_duration <= self.max_recovery_seconds and self.target_kalman is not None:
                 projected_bbox, (vx, vy) = self.target_kalman.predict()
-                self._draw_projected_search_box(annotated, projected_bbox, occlusion_duration)
+                if self.render_hud:
+                    self._draw_projected_search_box(annotated, projected_bbox, occlusion_duration)
 
         # Step 5: Distance & Following Control (State Machine Evaluation)
         active_color = "#00f0ff"
@@ -743,7 +782,7 @@ class CVPipeline:
         telemetry["obstacle_distances"] = obs_dists
 
         v_x, w_z = 0.0, 0.0
-        tracking = matched_target is not None or lidar_pc is not None
+        tracking = (matched_target is not None or lidar_pc is not None) and not self.ambiguous
         if tracking:
             tan_half = math.tan(math.radians(Config.CAMERA_HFOV_DEG) / 2.0)
             f_px = (w / 2.0) / tan_half
@@ -756,6 +795,7 @@ class CVPipeline:
             else:
                 # camera lost the owner but the LiDAR still has them: keep following, do not search
                 self.ekf.update(lidar_pc["range"], lidar_pc["bearing"], 0.06, math.radians(1.5))
+                self._owner_beams = lidar_pc["idx"]
                 fused_r, fused_b = self.ekf.range_bearing()
                 half = math.atan2(lidar_pc["width"] / 2.0, max(fused_r, 0.3)) + 0.06
                 self.fusion_mode = "LIDAR"
@@ -793,8 +833,8 @@ class CVPipeline:
                 # Idle state
                 v_x, w_z = 0.0, 0.0
             elif not self.following_enabled:
-                # Paused / locked state
-                self.target_state = Config.STATE_WAIT_FOR_OWNER_MOVEMENT
+                # Paused / locked state (or latched by STOP_HALT)
+                self.target_state = Config.STATE_SAFETY_STOP if self.safety_latched else Config.STATE_WAIT_FOR_OWNER_MOVEMENT
                 v_x, w_z = 0.0, 0.0
             else:
                 # Following is enabled for enrolled owner
@@ -832,6 +872,14 @@ class CVPipeline:
                         telemetry["nav_status"] = nav_status
 
             telemetry["phase2_cmd_vel"] = {"linear_x": round(v_x, 2), "angular_z": round(w_z, 2)}
+        elif self.ambiguous:
+            # Two equally good matches: hold still. No loss timer, so no memory pursuit or search either.
+            self.follow.reset()
+            self.last_ctl_t = None
+            if self.ekf.active:
+                self.ekf.coast(now, self.robot.current_linear, self.robot.current_angular)
+            telemetry["nav_status"] = "AMBIGUOUS_HOLD"
+            telemetry["phase2_cmd_vel"] = {"linear_x": 0.0, "angular_z": 0.0}
         else:
             # Owner is in neither the camera nor the LiDAR where we expect them
             self.follow.reset()
@@ -859,6 +907,14 @@ class CVPipeline:
                 telemetry["nav_status"] = "IDLE"
 
             telemetry["phase2_cmd_vel"] = {"linear_x": round(v_x, 2), "angular_z": round(w_z, 2)}
+
+        if self.safety_latched:
+            self.target_state = Config.STATE_SAFETY_STOP
+            v_x, w_z = 0.0, 0.0
+        # the state after this frame's transitions, not the one it started in
+        telemetry["target_state"] = self.target_state
+        telemetry["safety_latched"] = self.safety_latched
+        telemetry["ambiguous"] = self.ambiguous
 
         # Step 6: Safety Layer Evaluation
         safety_eval = self.safety.evaluate_safety(
@@ -889,9 +945,21 @@ class CVPipeline:
                                "lidar": self._lidar_fresh(),
                                "sectors": getattr(self, "_lidar_sectors", None) if self._lidar_fresh() else None}
 
+        # Co-mapping: the LiDAR scan projected into this image, and each person's LiDAR range from the beams
+        # that fall inside their box. The browser draws both over the live video.
+        proj = None
+        if self._lidar_fresh():
+            cam = fusion.CameraModel(w, h, self.cam_bearing_bias)
+            proj = cam.project_scan(self.lidar_ranges)
+        owner_beams = getattr(self, "_owner_beams", None) if tracking else None
+        telemetry["lidar_cam"] = fusion.overlay_points(proj, owner_beams) if proj is not None else []
         overlay = []
         for cand in candidates:
             x1, y1, x2, y2 = cand["bbox"]
+            lidar_m = None
+            if proj is not None:
+                lidar_m, _n = fusion.box_range(proj, cam.box_beams(proj, cand["bbox"]),
+                                               near=cand["distance_m"] * self.vision_scale)
             overlay.append({
                 "bbox": [
                     round(x1 / float(w), 4),
@@ -900,12 +968,20 @@ class CVPipeline:
                     round(y2 / float(h), 4),
                 ],
                 "target": bool(cand.get("is_target") or cand.get("is_owner")),
+                "owner": bool(cand.get("is_owner")),
                 "pose": cand.get("pose_norm") or [],
+                "cam_m": round(float(cand["distance_m"] * self.vision_scale), 2),
+                "lidar_m": None if lidar_m is None else round(lidar_m, 2),
+                "match": cand.get("similarity_to_owner"),
             })
         telemetry["overlay"] = overlay
+        telemetry["camera"] = {"hfov_deg": Config.CAMERA_HFOV_DEG, "yaw_deg": round(Config.CAM_YAW_DEG + math.degrees(self.cam_bearing_bias), 2)}
+        telemetry["control"] = {"desired": self.base_target_distance, "stop": round(self._stop_resume()[0], 2),
+                                "resume": round(self._stop_resume()[1], 2), "cmd_v": round(v_x, 3), "cmd_w": round(w_z, 3)}
 
         # Step 7: Render Tactical HUD with Obstacle Corridors
-        self._render_tactical_hud(annotated, candidates, matched_target, telemetry, w, h, corridor_boxes)
+        if self.render_hud:
+            self._render_tactical_hud(annotated, candidates, matched_target, telemetry, w, h, corridor_boxes)
 
         return telemetry, annotated
 
@@ -935,8 +1011,8 @@ class CVPipeline:
 
                         # Strict Anatomical Human Validation (Rejects chairs, furniture, clutter)
                         if self._is_valid_human_pose(pts, w, h):
-                            # Draw skeleton
-                            for p1, p2 in self.POSE_CONNECTIONS:
+                            # Draw skeleton (only when an OpenCV HUD is wanted; the dashboard draws its own)
+                            for p1, p2 in (self.POSE_CONNECTIONS if self.render_hud else ()):
                                 if p1 in pts and p2 in pts:
                                     if pts[p1][2] > 0.35 and pts[p2][2] > 0.35:
                                         cv2.line(annotated, (pts[p1][0], pts[p1][1]), (pts[p2][0], pts[p2][1]), (0, 240, 255), 2)
@@ -958,30 +1034,32 @@ class CVPipeline:
                             sh_l, sh_r = pts.get(11), pts.get(12)
                             hip_l, hip_r = pts.get(23), pts.get(24)
 
+                            # pinhole: range = f * real size / pixel size, sizes from Config (no magic constants)
+                            f_px = (w / 2.0) / math.tan(math.radians(Config.CAMERA_HFOV_DEG) / 2.0)
                             dist_estimates = []
                             if sh_l and sh_r and sh_l[2] > 0.35 and sh_r[2] > 0.35:
                                 sh_w = math.hypot(sh_r[0] - sh_l[0], sh_r[1] - sh_l[1])
                                 if sh_w > 15:
-                                    dist_estimates.append((235.0 / sh_w) * (w / 640.0))
+                                    dist_estimates.append(f_px * Config.PERSON_SHOULDER_M / sh_w)
 
                             if hip_l and hip_r and hip_l[2] > 0.35 and hip_r[2] > 0.35:
                                 hip_w = math.hypot(hip_r[0] - hip_l[0], hip_r[1] - hip_l[1])
                                 if hip_w > 15:
-                                    # Pelvic bi-iliac width (~30cm) vs shoulder (~44cm)
-                                    dist_estimates.append((160.0 / hip_w) * (w / 640.0))
+                                    dist_estimates.append(f_px * Config.PERSON_HIP_M / hip_w)
 
                             if sh_l and sh_r and hip_l and hip_r:
                                 th1 = abs(hip_l[1] - sh_l[1])
                                 th2 = abs(hip_r[1] - sh_r[1])
                                 torso_h = max(th1, th2)
                                 if torso_h > 35:
-                                    dist_estimates.append((230.0 / float(torso_h)) * (w / 640.0))
+                                    dist_estimates.append(f_px * Config.PERSON_TORSO_M / float(torso_h))
 
                             if dist_estimates:
                                 dist_m = sum(dist_estimates) / len(dist_estimates)
                             else:
                                 bbox_h = max(40, y2 - y1)
-                                dist_m = (320.0 / float(bbox_h)) * (w / 640.0)
+                                dist_m = f_px * Config.PERSON_BOX_M / float(bbox_h)
+                            dist_m *= Config.DISTANCE_SCALE
 
                             dist_m = max(0.35, min(4.50, dist_m))
 

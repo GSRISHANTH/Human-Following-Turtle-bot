@@ -25,6 +25,7 @@ class VideoStreamer:
         self.lock = threading.RLock()
         self.cond = threading.Condition(self.lock)
         self.latest_jpeg = None
+        self.latest_synthetic = True
         self.is_connected = False
         self.is_running = True
         self.source_mode = "network"  # 'network', 'sim'
@@ -67,6 +68,19 @@ class VideoStreamer:
                 self.cond.wait(timeout)
             return self.frame_count, self.latest_jpeg
 
+    def camera_frame_ok(self):
+        """True if the newest frame came from a working camera (not our offline pattern, not the Pi's
+        'no camera' placeholder). Only such frames may drive perception."""
+        with self.lock:
+            if self.latest_synthetic:
+                return False
+            if self.source_mode == "network":
+                # trust network frames only while a fresh Pi status says its camera works (sent at 2 Hz)
+                fresh = time.time() - self.pi_status_time < 3.0
+                if not (fresh and self.pi_status.get("camera") is not False):
+                    return False
+            return True
+
     def wait_scan(self, last_count, timeout=0.5):
         with self.cond:
             if self.scan_count == last_count:
@@ -88,11 +102,15 @@ class VideoStreamer:
                 "pi": dict(self.pi_status) if now - self.pi_status_time < 3.0 else {},
             }
 
-    def _publish(self, jpeg, connected=None):
+    def _publish(self, jpeg, connected=None, synthetic=False):
+        """synthetic: a generated picture (offline pattern). It is shown, but it is not a camera frame:
+        it does not reset the frame age and the vision process never sees it."""
         with self.cond:
             self.latest_jpeg = jpeg
+            self.latest_synthetic = synthetic
             self.frame_count += 1
-            self.last_frame_time = time.time()
+            if not synthetic:
+                self.last_frame_time = time.time()
             if connected is not None:
                 self.is_connected = connected
             self.cond.notify_all()
@@ -219,7 +237,7 @@ class VideoStreamer:
 
         ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
         if ok:
-            self._publish(buf.tobytes())
+            self._publish(buf.tobytes(), synthetic=True)
 
     def _generate_simulation_frame(self):
         """Animated humanoid figure walking back and forth."""

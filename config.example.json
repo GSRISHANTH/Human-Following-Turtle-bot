@@ -1,0 +1,13 @@
+{
+  "PI_IP": "10.242.147.140",
+  "DESIRED_DISTANCE": 1.2,
+  "CAMERA_HFOV_DEG": 57.0,
+  "CAM_X_M": 0.04,
+  "CAM_Y_M": 0.0,
+  "CAM_HEIGHT_M": 0.20,
+  "LIDAR_HEIGHT_M": 0.17,
+  "CAM_YAW_DEG": 0.0,
+  "CAM_PITCH_DEG": 0.0,
+  "DISTANCE_SCALE": 1.0,
+  "MAX_POSES": 3
+}

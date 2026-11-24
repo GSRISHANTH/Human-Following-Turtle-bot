@@ -31,9 +31,28 @@ def _apply(engine, cmd):
     elif op == "pi_ip":
         engine.robot.update_pi_ip(cmd.get("ip", ""))
     elif op == "calibration":
-        engine.distance_calibration = float(cmd["value"])
+        Config.DISTANCE_SCALE = max(0.5, min(2.0, float(cmd["value"])))
+        engine.distance_calibration = Config.DISTANCE_SCALE
     elif op == "target_distance":
         engine.base_target_distance = max(Config.MIN_FOLLOW_DISTANCE, min(3.5, float(cmd["value"])))
+    elif op == "set":
+        # live tuning from the dashboard settings panel; the parent process has validated the names
+        for name, value in (cmd.get("values") or {}).items():
+            try:
+                v = Config.set(name, value)
+            except (KeyError, ValueError, TypeError):
+                ok = False
+                continue
+            if name == "DESIRED_DISTANCE":
+                engine.base_target_distance = max(Config.MIN_FOLLOW_DISTANCE, min(3.5, v))
+            elif name == "MAX_LINEAR_VEL":
+                engine.robot.max_linear = v
+            elif name == "MAX_ANGULAR_VEL":
+                engine.robot.max_angular = v
+            elif name == "PI_IP":
+                engine.robot.update_pi_ip(v)
+            elif name == "DISTANCE_SCALE":
+                engine.distance_calibration = v
     elif op == "lidar":
         engine.set_lidar(cmd["bins"])
     elif op == "plan":
@@ -90,10 +109,13 @@ def run_cv(jpeg_q, out_q, cmd_q, reply_q):
         from config import Config
     except ImportError as exc:
         print(f"[Vision] Cannot start: {exc}. This Python ({sys.executable}) is missing a package; "
-              "use `py -3.11 app.py` or `pip install mediapipe opencv-python numpy`.", flush=True)
+              "run `python -m pip install -r requirements.txt`.", flush=True)
         sys.exit(3)
 
     engine = CVPipeline()
+    engine.render_hud = False          # the browser draws pose, boxes and the LiDAR overlay itself
+    last_frame_at = time.time()
+    video_lost = False
     pose_count = 0
     pose_window = time.time()
     pose_fps = 0.0
@@ -105,6 +127,14 @@ def run_cv(jpeg_q, out_q, cmd_q, reply_q):
         try:
             jpeg = jpeg_q.get(timeout=0.05)
         except queue.Empty:
+            # No real camera frame: never keep driving on old perception, and say so on the dashboard.
+            if not video_lost and time.time() - last_frame_at > Config.STALE_FRAME_TIMEOUT:
+                video_lost = True
+                engine.robot.update_auto_commands(0.0, 0.0, can_move=False)
+                engine._log_event("VIDEO_LOST", "No camera frames. Robot stopped; it resumes when video returns.")
+                _publish(out_q, {"video_lost": True, "events": list(engine.event_log[-12:]),
+                                 "robot_telemetry": engine.robot.get_telemetry(), "pose_fps": 0.0,
+                                 "phase2_cmd_vel": {"linear_x": 0.0, "angular_z": 0.0}})
             continue
         except Exception:
             continue
@@ -124,6 +154,10 @@ def run_cv(jpeg_q, out_q, cmd_q, reply_q):
         if jpeg is None:
             break
         jpeg, t_frame = jpeg
+        last_frame_at = time.time()
+        if video_lost:
+            video_lost = False
+            engine._log_event("VIDEO_RESTORED", "Camera frames are back.")
 
         _drain_commands(engine, cmd_q, reply_q)
         frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
@@ -150,5 +184,7 @@ def run_cv(jpeg_q, out_q, cmd_q, reply_q):
         tel["calibration"] = engine.distance_calibration
         tel["following_enabled"] = engine.following_enabled
         tel["pose_fps"] = pose_fps
+        tel["video_lost"] = False
+        tel["settings"] = Config.tunables()
         _publish(out_q, tel)
         _drain_commands(engine, cmd_q, reply_q)
