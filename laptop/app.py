@@ -602,7 +602,7 @@ def api_robot_mode():
 
 @app.route("/api/teleop", methods=["POST"])
 def api_teleop():
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     lin = float(data.get("linear", 0.0))
     ang = float(data.get("angular", 0.0))
     _cv_call("teleop", linear=lin, angular=ang)

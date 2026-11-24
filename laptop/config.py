@@ -74,12 +74,20 @@ class Config:
     SEARCH_START_DELAY_SEC = 0.4          # Seconds after losing target before starting rotation
 
     # --- Following & Distance Hysteresis (Meters) ---
-    DESIRED_DISTANCE = 1.20       # Desired following distance
+    DESIRED_DISTANCE = 2.00       # Desired following distance (also the minimum gap it keeps: see BACK_OFF_*)
     TARGET_DISTANCE = DESIRED_DISTANCE  # Compatibility alias
     STOP_DISTANCE = 1.10          # Enter WAIT_FOR_OWNER_MOVEMENT when d <= STOP_DISTANCE
     RESUME_DISTANCE = 1.35        # Resume FOLLOWING when d >= RESUME_DISTANCE (prevents chatter)
     RESUME_HYSTERESIS_FRAMES = 3  # Must exceed RESUME_DISTANCE for 3 consecutive frames
-    MIN_CRITICAL_DISTANCE = 0.55  # Immediate safety stop boundary
+    MIN_CRITICAL_DISTANCE = 0.55  # Immediate safety stop boundary (forward blocked; backing away still allowed)
+    # Back-off: someone walks up closer than the follow distance -> reverse to restore it, facing them.
+    BACK_OFF_ENABLED = True
+    BACK_OFF_MARGIN = 0.25        # start reversing below DESIRED - margin (1.75 m at 2 m) ...
+    BACK_OFF_RELEASE = 0.05       # ... stop once back to DESIRED - release (hysteresis, no shuffling)
+    BACK_OFF_GAIN = 0.6           # m/s per metre too close
+    MAX_REVERSE_VEL = 0.15        # m/s; slower than forward because the camera cannot see behind
+    REVERSE_CLEARANCE_M = 0.35    # LiDAR rear sector must be at least this clear to reverse at all
+    LIDAR_REAR_STOP_M = 0.20      # controller hard stop for reverse, like LIDAR_HARD_STOP_M for forward
 
     # --- PID & Velocity Control Limits ---
     MAX_LINEAR_VEL = 0.22         # Physical limit for TurtleBot3 Burger (m/s)
@@ -203,7 +211,7 @@ class Config:
     TUNABLE = ("DESIRED_DISTANCE", "DISTANCE_SCALE", "CAMERA_HFOV_DEG", "CAM_X_M", "CAM_Y_M", "CAM_HEIGHT_M",
                "LIDAR_HEIGHT_M", "CAM_YAW_DEG", "CAM_PITCH_DEG", "CAM_MIRROR", "LIDAR_MIRROR", "LIDAR_YAW_DEG", "MAX_LINEAR_VEL", "MAX_ANGULAR_VEL",
                "PID_DIST_KP", "PID_DIST_KI", "PID_DIST_KD", "PID_TURN_KP", "PID_TURN_KI", "PID_TURN_KD",
-               "FOLLOW_REQUIRES_RAISED_HAND", "RECOVERY_DRIVE_TO_LAST_SEEN", "DIST_SPEED_GAIN", "DIST_CONF_GAIN",
+               "FOLLOW_REQUIRES_RAISED_HAND", "RECOVERY_DRIVE_TO_LAST_SEEN", "BACK_OFF_ENABLED", "MAX_REVERSE_VEL", "DIST_SPEED_GAIN", "DIST_CONF_GAIN",
                "PID_FF_GAIN", "PID_TURN_FF", "MAX_ACCEL_ANGULAR", "IDENTITY_MATCH_THRESHOLD", "REACQ_THRESHOLD", "PI_IP")
 
     @classmethod

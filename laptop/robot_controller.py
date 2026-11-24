@@ -43,6 +43,8 @@ class RobotController:
         self.watchdog_timeout = 0.6  # seconds
         self.emergency_stop = False
         self.front_clear = None       # LiDAR nearest return straight ahead (m), person included
+        self.rear_clear = None        # LiDAR nearest return straight behind (m)
+        self.rear_clear_time = 0.0
         self.front_clear_time = 0.0
         
         # Hardware connection endpoints
@@ -83,6 +85,11 @@ class RobotController:
         """Releases emergency stop and returns to AUTO mode"""
         self.set_mode("AUTO")
 
+    def set_rear_clearance(self, meters, stamp):
+        with self.lock:
+            self.rear_clear = meters
+            self.rear_clear_time = stamp
+
     def set_front_clearance(self, meters, stamp):
         with self.lock:
             self.front_clear = meters
@@ -103,7 +110,7 @@ class RobotController:
                 self.target_angular = 0.0
                 return
 
-            self.target_linear = max(-0.10, min(self.max_linear, linear_v))
+            self.target_linear = max(-Config.MAX_REVERSE_VEL, min(self.max_linear, linear_v))
             self.target_angular = max(-self.max_angular, min(self.max_angular, angular_w))
             self.last_command_time = time.time()
 
@@ -152,6 +159,13 @@ class RobotController:
                 if time.time() - self.last_command_time > self.watchdog_timeout:
                     self.target_linear = 0.0
                     self.target_angular = 0.0
+
+                # Reverse hard stop: never back into something, and never reverse without a fresh rear reading
+                if self.target_linear < 0.0 and self.mode == "AUTO" and not (
+                        self.rear_clear is not None and time.time() - self.rear_clear_time < 0.6
+                        and self.rear_clear >= Config.LIDAR_REAR_STOP_M):
+                    self.target_linear = 0.0
+                    self.current_linear = max(self.current_linear, 0.0)
 
                 # LiDAR hard stop, independent of vision: never drive into something right ahead
                 if (self.front_clear is not None and time.time() - self.front_clear_time < 0.6

@@ -26,4 +26,6 @@ Config.COMMAND_MODE = "mock"
 Config.FOLLOW_REQUIRES_RAISED_HAND = False
 # The recall suites exercise the optional drive-to-last-seen recovery; the default (rotate only) is tested on its own.
 Config.RECOVERY_DRIVE_TO_LAST_SEEN = True
+# The older suites were written for a 1.2 m follow distance; the 2 m default and back-off have their own tests.
+Config.DESIRED_DISTANCE = Config.TARGET_DISTANCE = 1.2
 Config.PI_IP = "127.0.0.1"

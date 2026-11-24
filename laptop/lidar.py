@@ -173,6 +173,9 @@ def sectors(ranges, exclude=None, max_range=3.5):
         "left": nearest(r_masked, FRONT_HALF_DEG, SIDE_OUTER_DEG),
         "right": nearest(r_masked, -SIDE_OUTER_DEG, -FRONT_HALF_DEG),
         "front_raw": nearest(r, -15.0, 15.0),
+        # behind the robot (|bearing| >= 145 deg), person beams masked / raw: used only when backing off
+        "rear": min(nearest(r_masked, 145.0, 180.0), nearest(r_masked, -180.0, -145.0)),
+        "rear_raw": min(nearest(r, 160.0, 180.0), nearest(r, -180.0, -160.0)),
     }
 
 

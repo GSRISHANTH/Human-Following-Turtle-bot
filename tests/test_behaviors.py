@@ -43,6 +43,7 @@ class Behaviours(unittest.TestCase):
         p.plan, p.plan_time = None, 0.0
         p.memory_done, p.search_t0 = False, None
         p.lidar_ranges = None
+        p._dist_extra, p._backing = 0.0, False
 
     def track_at(self, rng, bearing_deg=0.0):
         p = self.pipe
@@ -61,9 +62,9 @@ class Behaviours(unittest.TestCase):
 
     def test_close_range_waits_on_lidar_and_does_not_search(self):
         p = self.pipe
-        self.track_at(0.9)
+        self.track_at(1.15)       # inside the stop distance, above the back-off line (LiDAR-only adds a confidence margin)
         for _ in range(12):
-            tel = self.frame({0: 0.9})
+            tel = self.frame({0: 1.15})
         self.assertEqual(tel["target_state"], Config.STATE_WAIT_FOR_OWNER_MOVEMENT)
         self.assertTrue(tel["fusion"]["lidar_only"])
         self.assertEqual(tel["fusion"]["mode"], "LIDAR")
@@ -337,6 +338,59 @@ class Behaviours(unittest.TestCase):
         self.assertEqual(tel["phase2_cmd_vel"], {"linear_x": 0.0, "angular_z": 0.0})
         self.assertEqual(p.robot.target_linear, 0.0)
         self.assertTrue(any(e["type"] == "SENSOR_FAULT" for e in p.event_log))
+
+    def test_owner_walking_up_makes_it_back_off_to_the_follow_distance(self):
+        """2 m follow distance, owner walks up to 1.4 m: the robot reverses (rear clear), faces them, and stops
+        reversing once the gap is back to ~2 m. Blocked rear or no LiDAR: it does not reverse."""
+        p = self.pipe
+        p.base_target_distance, p._dist_extra, p._backing = 2.0, 0.0, False
+        self.track_at(1.4)
+        rear = {180: 1.5}
+        tel = None
+        for _ in range(6):
+            tel = self.frame({0: 1.4, **rear})
+        self.assertEqual(tel["nav_status"], "BACKING_OFF")
+        self.assertLess(tel["phase2_cmd_vel"]["linear_x"], 0.0)
+        self.assertGreaterEqual(tel["phase2_cmd_vel"]["linear_x"], -Config.MAX_REVERSE_VEL)
+        self.assertLess(p.robot.target_linear, 0.0, "the reverse command reaches the controller")
+        back = p._desired()                              # gap restored (set distance + current confidence margin)
+        self.track_at(back)
+        for _ in range(4):
+            tel = self.frame({0: back, **rear})
+        self.assertGreaterEqual(tel["phase2_cmd_vel"]["linear_x"], 0.0)
+        self.assertFalse(p._backing)
+        # something right behind: never reverses into it
+        self.track_at(1.4)
+        for _ in range(4):
+            tel = self.frame({0: 1.4, 180: 0.25})
+        self.assertEqual(tel["nav_status"], "BACK_OFF_BLOCKED")
+        self.assertEqual(tel["phase2_cmd_vel"]["linear_x"], 0.0)
+
+    def test_someone_very_close_may_be_backed_away_from(self):
+        """The proximity safety stop (< 0.55 m) blocks forward motion but not backing away."""
+        p = self.pipe
+        p.base_target_distance, p._dist_extra, p._backing = 2.0, 0.0, False
+        self.track_at(0.5)
+        for _ in range(4):
+            tel = self.frame({-2: 0.5, 2: 0.5, 180: 1.5})      # one contiguous person-wide cluster at 0.5 m
+        self.assertEqual(tel["safety_status"], "CRITICAL_PROXIMITY_STOP")
+        self.assertLess(p.robot.target_linear, 0.0)
+
+    def test_controller_never_reverses_without_a_fresh_clear_rear(self):
+        r = self.pipe.robot
+        r.set_mode("AUTO")
+        r.set_rear_clearance(None, 0.0)
+        r.update_auto_commands(-0.1, 0.0)
+        time.sleep(0.12)
+        self.assertGreaterEqual(r.current_linear, 0.0, "no rear reading: reverse refused")
+        r.set_rear_clearance(1.0, time.time())
+        r.update_auto_commands(-0.1, 0.0)
+        time.sleep(0.15)
+        self.assertLess(r.current_linear, 0.0)
+        r.set_rear_clearance(0.1, time.time())
+        time.sleep(0.12)
+        self.assertGreaterEqual(r.current_linear, 0.0, "obstacle inside the rear hard stop")
+        r.update_auto_commands(0.0, 0.0)
 
     def test_pursuit_times_out(self):
         p = self.pipe

@@ -73,6 +73,7 @@ class CVPipeline:
         self.render_hud = True        # the dashboard draws in the browser; the worker turns the OpenCV HUD off
         self.lidar_cam = []           # LiDAR beams projected into the image, for the co-mapped overlay
         self.hand_raised = False      # hold-to-follow: owner's hand is up (debounced)
+        self._backing = False         # backing off because the owner came closer than the follow distance
         self._raise_n = 0
         self._last_raise_t = 0.0
         self._raised_at_loss = False  # was the hand up when the camera lost the owner (then keep up by LiDAR)
@@ -106,6 +107,7 @@ class CVPipeline:
         # Dynamic distance parameters
         self.base_target_distance = Config.DESIRED_DISTANCE
         self.dynamic_target_distance = self.base_target_distance
+        self._dist_extra = 0.0        # smoothed margin on top of the set distance (speed headway + low confidence)
         self.distance_calibration = Config.DISTANCE_SCALE   # kept for the dashboard; the value used is Config.DISTANCE_SCALE
         
         # Smoothing filters for target
@@ -383,9 +385,14 @@ class CVPipeline:
             templates[1 + self.template_count % (len(templates) - 1)] = sig.copy()
         self.last_template_t = now
 
+    def _desired(self):
+        """Current follow distance: the operator's set distance (always taken as is, immediately) + the smoothed
+        margin. Only the margin is smoothed, so lowering the set distance never leaves a stale larger target."""
+        return max(Config.MIN_FOLLOW_DISTANCE, self.base_target_distance) + self._dist_extra
+
     def _stop_resume(self):
         """Wait distance and resume distance, derived from the current (dynamic) follow distance."""
-        d = max(Config.MIN_FOLLOW_DISTANCE, self.base_target_distance, self.dynamic_target_distance)
+        d = self._desired()
         return max(0.4, d - 0.10), d + 0.15
 
     def _update_dynamic_distance(self):
@@ -401,10 +408,11 @@ class CVPipeline:
             unc = max(0.0, min(1.0, (sigma - 0.05) / 0.25))
             conf = 1.0 - max(unc, mode_pen, reid_pen)
             extra = Config.DIST_SPEED_GAIN * speed + Config.DIST_CONF_GAIN * (1.0 - conf)
-        target = base + max(0.0, min(Config.DIST_MAX_EXTRA, extra))
-        # grow quickly (safety), shrink slowly (no chasing the set point)
-        a = 0.3 if target > self.dynamic_target_distance else 0.05
-        self.dynamic_target_distance = max(base, (1 - a) * self.dynamic_target_distance + a * target)
+        target = max(0.0, min(Config.DIST_MAX_EXTRA, extra))
+        # the margin grows quickly (safety) and shrinks slowly (no chasing the set point)
+        a = 0.3 if target > self._dist_extra else 0.05
+        self._dist_extra = (1 - a) * self._dist_extra + a * target
+        self.dynamic_target_distance = base + self._dist_extra
         self.tracking_confidence = round(conf, 2)
         return self.dynamic_target_distance
 
@@ -584,6 +592,35 @@ class CVPipeline:
                 return 0.0, 0.0, "SEARCH_BLOCKED"
         return 0.0, w, status
 
+    def _back_off(self, dist, bearing, half, rng):
+        """Owner closer than the follow distance (they walked up to the robot): reverse until the gap is restored,
+        turning to keep them centred. Only with a fresh LiDAR and a clear rear sector; the controller adds a hard
+        rear stop. Returns (v, w, status) while backing off, else None."""
+        if not Config.BACK_OFF_ENABLED:
+            return None
+        desired = self._desired()
+        if getattr(self, "_backing", False):
+            if dist >= desired - Config.BACK_OFF_RELEASE:
+                self._backing = False
+        elif dist < desired - Config.BACK_OFF_MARGIN:
+            self._backing = True
+            self._log_event("BACKING_OFF", f"Owner came within {dist:.2f} m: reversing to keep {desired:.1f} m.")
+        if not self._backing:
+            return None
+        w = self._face_person(bearing)
+        if not self._lidar_fresh():
+            return 0.0, w, "BACK_OFF_NO_LIDAR"          # cannot see behind: never reverse blind
+        sec = lidar_lib.sectors(self.lidar_ranges, exclude=(bearing, half, rng))
+        self.robot.set_rear_clearance(sec["rear_raw"], self.lidar_time)
+        self._lidar_sectors = sec
+        if sec["rear"] < Config.REVERSE_CLEARANCE_M:
+            return 0.0, w, "BACK_OFF_BLOCKED"
+        v = Config.BACK_OFF_GAIN * (dist - desired)    # negative: too close
+        v = max(-Config.MAX_REVERSE_VEL, min(-Config.PID_MIN_V, v))
+        # slow down as the rear gets tight
+        v *= max(0.3, min(1.0, (sec["rear"] - Config.REVERSE_CLEARANCE_M) / 0.4 + 0.3))
+        return v, w, "BACKING_OFF"
+
     def _owner_lost(self):
         if self.target_state != Config.STATE_OWNER_LOST:
             self._log_event("OWNER_LOST", "Search finished without finding the owner. Stopped; waiting for them to reappear.")
@@ -686,7 +723,7 @@ class CVPipeline:
         ang_rate = (px * uy - py * ux) / max(px * px + py * py, 0.09)   # the person's own motion across the view
         v, w_cmd = self.follow.command(rng, b_ctl, self.ekf.range_rate(),
                                        self.ekf.bearing_rate(self.robot.current_angular), los, dt,
-                                       desired=self.dynamic_target_distance,
+                                       desired=self._desired(),
                                        person_ang_rate=0.0 if detour else ang_rate)
         if self._lidar_fresh():
             sec = lidar_lib.sectors(self.lidar_ranges, exclude=(bearing, half, rng))
@@ -981,6 +1018,9 @@ class CVPipeline:
                 self.last_ctl_t = None
                 v_x, w_z = 0.0, self._face_person(fused_b)
                 telemetry["nav_status"] = "AWAITING_GESTURE"
+                bo = self._back_off(dist, fused_b, half, fused_r)
+                if bo is not None:
+                    v_x, w_z, telemetry["nav_status"] = bo
             else:
                 # Following is enabled for enrolled owner
                 # Required transition: FOLLOWING -> WAIT_FOR_OWNER_MOVEMENT
@@ -990,7 +1030,11 @@ class CVPipeline:
                     v_x = 0.0
                     # Gentle camera re-centering if owner steps laterally while standing near
                     w_z = self._face_person(fused_b)
+                    bo = self._back_off(dist, fused_b, half, fused_r)
+                    if bo is not None:
+                        v_x, w_z, telemetry["nav_status"] = bo
                 elif dist >= resume_d or self.target_state == Config.STATE_FOLLOWING:
+                    self._backing = False
                     if self.target_state == Config.STATE_WAIT_FOR_OWNER_MOVEMENT:
                         self.resume_counter += 1
                         if self.resume_counter >= Config.RESUME_HYSTERESIS_FRAMES:
@@ -1007,7 +1051,8 @@ class CVPipeline:
                         v_x = 0.0
                         w_z = 0.0
                 else:
-                    # In hysteresis band (1.10m - 1.35m)
+                    # In hysteresis band (stop .. resume): not too close, so no back-off latch survives here
+                    self._backing = False
                     if self.target_state == Config.STATE_WAIT_FOR_OWNER_MOVEMENT:
                         v_x = 0.0
                         w_z = self._face_person(fused_b)
@@ -1099,6 +1144,10 @@ class CVPipeline:
             telemetry["target_state"],
             manual_stop_gesture=manual_stop_signal
         )
+        if (safety_eval["status"] == "CRITICAL_PROXIMITY_STOP" and v_x < 0.0 and not self.safety_latched
+                and not lidar_fault):
+            safety_eval["can_move"] = True                # backing away from someone too close is the safe move
+            safety_eval["alerts"] = list(safety_eval["alerts"]) + ["Backing away from the person"]
         if lidar_fault:
             safety_eval["status"], safety_eval["can_move"] = "SENSOR_FAULT", False
             safety_eval["alerts"] = list(safety_eval["alerts"]) + ["Sensor: LiDAR data stale (> %.1f s)" % Config.LIDAR_FAULT_SEC]
@@ -1156,9 +1205,9 @@ class CVPipeline:
         telemetry["overlay"] = overlay
         telemetry["mirror_suspect"] = bool(getattr(self, "mirror_suspect", False))
         telemetry["camera"] = {"mirror": bool(Config.CAM_MIRROR), "hfov_deg": Config.CAMERA_HFOV_DEG, "yaw_deg": round(Config.CAM_YAW_DEG + math.degrees(self.cam_bearing_bias), 2)}
-        telemetry["dynamic_target_distance"] = round(self.dynamic_target_distance, 2)
+        telemetry["dynamic_target_distance"] = round(self._desired(), 2)
         telemetry["tracking_confidence"] = getattr(self, "tracking_confidence", None)
-        telemetry["control"] = {"set": self.base_target_distance, "desired": round(self.dynamic_target_distance, 2), "stop": round(self._stop_resume()[0], 2),
+        telemetry["control"] = {"set": self.base_target_distance, "desired": round(self._desired(), 2), "stop": round(self._stop_resume()[0], 2),
                                 "resume": round(self._stop_resume()[1], 2), "cmd_v": round(v_x, 3), "cmd_w": round(w_z, 3)}
 
         # Step 7: Render Tactical HUD with Obstacle Corridors
