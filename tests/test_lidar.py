@@ -15,6 +15,10 @@ import tb_proto  # noqa: E402
 import lidar  # noqa: E402
 
 
+def wrap_deg(a):
+    return (a + 180.0) % 360.0 - 180.0
+
+
 def bins_with(obstacles, n=360, default=0):
     """obstacles: {bearing_deg: metres}; every bin within 3 degrees gets that range."""
     out = [default] * n
@@ -103,11 +107,49 @@ class Map(unittest.TestCase):
         img = m.render(person={"x": 1.0, "y": 0.2, "vx": 0.1, "vy": 0.0}, sec=lidar.sectors(m.bins))
         self.assertEqual(img.shape, (lidar.LidarMap.VIEW, lidar.LidarMap.VIEW, 3))
 
-    def test_no_odometry_does_not_accumulate(self):
+    def test_no_odometry_maps_by_scan_matching_alone(self):
+        """Without /odom the map is still built (scan matching is the odometry) and the pose stays defined."""
+        from tests.test_navigation import room_scan
         m = lidar.LidarMap()
-        m.update([1000] * 360, None)
-        self.assertEqual(float(np.abs(m.grid).sum()), 0.0)
+        for _ in range(5):
+            m.update(room_scan((0.0, 0.0, 0.0), [(0.8, -0.3, 1.1, 0.0)]), None)
+        self.assertEqual(m.source, "scan")
+        self.assertIsNotNone(m.pose)
+        self.assertGreater(float((m.grid > 1.2).sum()), 50)
         m.render()
+
+    def test_grid_follows_the_robot_past_its_edge(self):
+        """The 12 m grid shifts with the robot instead of losing it (planner would report OFF_MAP)."""
+        from tests.test_navigation import room_scan
+        m = lidar.LidarMap()
+        walls = [(-20, 1.0, 20, 1.2), (-20, -1.2, 20, -1.0)] + [(x, 0.6, x + 0.2, 1.0) for x in range(-6, 8, 2)]
+        x = 0.0
+        for _ in range(120):
+            m.update(room_scan((x, 0.0, 0.0), walls, half=(30, 30)), (x, 0.0, 0.0))
+            x += 0.05
+        self.assertGreaterEqual(m.recenters, 1)
+        self.assertLess(abs(m.pose[0] - (x - 0.05)), 0.05)
+        half = m.N * m.RES / 2
+        self.assertLess(abs(m.pose[0] - m.origin[0]), half - 1.0, "robot must stay well inside the grid")
+
+    def test_people_are_kept_out_of_the_map(self):
+        from tests.test_navigation import room_scan
+        m = lidar.LidarMap()
+        for _ in range(30):
+            m.update(room_scan((0.0, 0.0, 0.0), [(1.4, -0.15, 1.6, 0.15)]), (0.0, 0.0, 0.0), person=(1.5, 0.0))
+        gx, gy = m._cell(np.array([1.45]), np.array([0.0]))
+        self.assertLess(float(m.grid[gy[0], gx[0]]), 0.5, "the owner must not become a wall in the map")
+
+    def test_scan_only_tracks_a_moving_robot(self):
+        from tests.test_navigation import room_scan
+        m = lidar.LidarMap()
+        box = [(0.8, -0.3, 1.1, 0.0), (-1.5, 0.8, -1.2, 1.2)]
+        x = 0.0
+        for i in range(40):
+            m.update(room_scan((x, 0.0, 0.01 * i), box), None)
+            x += 0.03
+        self.assertLess(math.hypot(m.pose[0] - x + 0.03, m.pose[1]), 0.10, f"pose {m.pose}, true x {x - 0.03:.2f}")
+        self.assertLess(abs(wrap_deg(math.degrees(m.pose[2]) - math.degrees(0.39))), 4.0)
 
 
 if __name__ == "__main__":

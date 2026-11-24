@@ -34,6 +34,7 @@ import tb_proto
 from hil.camera_worker import camera_process
 from hil.map_view import render_map
 from hil.plant import BurgerPlant
+from hil.world import raycast
 
 MAP_PORT = 5001
 FRAME_W = 640
@@ -186,7 +187,7 @@ def _sender_loop():
             status = {"ros": "HIL", "subs": 1, "serial": False, "motors": False, "camera": _camera_ok,
                       "cam_fps": TARGET_FPS, "send_fps": round(_send_fps, 1), "raw": False,
                       "cmd_age": None, "cmds": _cmd_count,
-                      "lin": snap["linear"], "ang": snap["angular"]}
+                      "lin": snap["linear"], "ang": snap["angular"], "scan_hz": 10.0, "slam": False}
             try:
                 _sock.sendto(tb_proto.pack_status(status, time.time()), dest)
             except OSError:
@@ -313,8 +314,26 @@ def health():
     })
 
 
+def _lidar_loop():
+    """10 Hz simulated LDS-02 scan of hil/world.py's room, with the plant's odometry, like the real /scan + /odom."""
+    while not _stop:
+        time.sleep(0.1)
+        now = time.monotonic()
+        with _state_lock:
+            dest = _peer if (_peer is not None and now - _peer_time < PEER_TIMEOUT) else None
+        if dest is None:
+            continue
+        snap = plant.snapshot()
+        pose = (snap["x"], snap["y"], snap["theta"])
+        try:
+            _sock.sendto(tb_proto.pack_scan(raycast(pose), pose, time.time()), dest)
+        except OSError:
+            pass
+
+
 def main():
     threading.Thread(target=_plant_loop, daemon=True).start()
+    threading.Thread(target=_lidar_loop, daemon=True).start()
     threading.Thread(target=_udp_loop, daemon=True).start()
     threading.Thread(target=_camera_loop, daemon=True).start()
     threading.Thread(target=_sender_loop, daemon=True).start()

@@ -15,6 +15,16 @@ import time
 import cv2
 import numpy as np
 
+try:
+    from config import Config as _Config
+except ImportError:          # lidar.py is also usable on its own (HIL map view)
+    _Config = None
+
+
+def Config_get(name, default):
+    return getattr(_Config, name, default) if _Config is not None else default
+
+
 FRONT_HALF_DEG = 25.0
 SIDE_OUTER_DEG = 80.0
 
@@ -188,13 +198,17 @@ C_MOVING = (40, 170, 255)
 
 
 class LidarMap:
-    """Occupancy grid (0.05 m cells, 12 m x 12 m) in a corrected odometry frame, with scan matching."""
+    """2-D SLAM: log-odds occupancy grid (0.05 m cells, 12 m x 12 m window that follows the robot) and
+    scan-to-map localisation. Pose sources, best first:
+      'slam'  map-frame pose from slam_toolbox / Cartographer on the Pi (pose_src 2): used as is
+      'odom'  wheel odometry from /odom, corrected by scan matching (the correction T is kept between scans)
+      'scan'  no odometry at all: scan matching alone, with a constant-velocity prior (Hector-style)"""
 
     RES = 0.05
     N = 240
     VIEW = 460
     VIEW_RADIUS_M = 4.5
-    WARMUP_SCANS = 25
+    WARMUP_SCANS = 10                 # scans integrated before matching starts (odometry source)
 
     def __init__(self):
         self.grid = np.zeros((self.N, self.N), dtype=np.float32)  # log-odds
@@ -208,11 +222,17 @@ class LidarMap:
         self.dt_avg = 0.1
         self.scans = 0
         self.loc_score = 0.0
+        self.loc_ok = False
         self.loc_shift = 0.0              # metres of correction applied so far
         self.resets = 0                   # odometry restarts detected
+        self.recenters = 0
+        self.source = None                # 'slam' | 'odom' | 'scan'
+        self.vel = (0.0, 0.0, 0.0)        # pose change per scan, for the scan-only prior
         self.trail = []
         self.clusters = []
         self.labels = []
+        self.dynamic = []                 # per cluster: True = person / moving, kept out of the map
+        self._persist = {}                # world 0.3 m bucket -> consecutive scans a "moving" cluster stayed there
 
     def reset(self):
         self.grid[:] = 0.0
@@ -221,6 +241,8 @@ class LidarMap:
         self.scans = 0
         self.trail = []
         self.loc_shift = 0.0
+        self.pose = None
+        self.vel = (0.0, 0.0, 0.0)
 
     # --- frames ---
 
@@ -246,43 +268,170 @@ class LidarMap:
         dx, dy = wx - px, wy - py
         return c * dx - s * dy, s * dx + c * dy
 
-    # --- localisation: correlative scan matching against the map built so far ---
+    # --- localisation: multi-resolution correlative scan matching + Gauss-Newton refinement ---
+    #
+    # 1. Likelihood field  L(c) = exp(-d(c)^2 / 2 sigma^2), d = distance from cell c to the nearest occupied cell.
+    # 2. Pyramid: level k is L max-pooled over 2^k x 2^k cells, so a coarse score is an upper bound of the fine one
+    #    (Olson, "M3RSM", ICRA 2015). Search the whole window coarsely, then refine around the best few candidates.
+    # 3. Gauss-Newton on the bilinearly interpolated field (Kohlbrecher et al., Hector SLAM, SSRR 2011) for a
+    #    sub-cell answer.
+    # Score = mean field value at the scan endpoints, in [0, 1].
+
+    def _field(self):
+        occ = (self.grid > 1.2).astype(np.uint8)
+        if int(occ.sum()) < 60:
+            return None
+        dist = cv2.distanceTransform(1 - occ, cv2.DIST_L2, 5) * self.RES
+        sig = max(0.02, float(Config_get("SLAM_SIGMA_M", 0.06)))
+        field = np.exp(-(dist * dist) / (2.0 * sig * sig)).astype(np.float32)
+        pyr = [field]
+        for _ in range(2):
+            f = pyr[-1]
+            h, w = (f.shape[0] + 1) // 2 * 2, (f.shape[1] + 1) // 2 * 2
+            pad = np.zeros((h, w), np.float32)
+            pad[:f.shape[0], :f.shape[1]] = f
+            pooled = pad.reshape(h // 2, 2, w // 2, 2).max(axis=(1, 3))
+            # dilate by one so a coarse cell bounds every fine offset that maps near it
+            pyr.append(cv2.dilate(pooled, np.ones((3, 3), np.uint8)))
+        return pyr
+
+    def _score_grid(self, field, scale, pts, pose, offsets):
+        """pts (M,2) robot frame; offsets (K,2) world dx,dy. Returns K mean field values at pose (+offset)."""
+        c, s = math.cos(pose[2]), math.sin(pose[2])
+        wx = pose[0] + c * pts[:, 0] - s * pts[:, 1]
+        wy = pose[1] + s * pts[:, 0] + c * pts[:, 1]
+        ox, oy = self.origin
+        res = self.RES * scale
+        n = field.shape[0]
+        gx = np.floor(((wx[None, :] + offsets[:, 0:1]) - ox) / res + n / 2).astype(np.int32)
+        gy = np.floor(n / 2 - ((wy[None, :] + offsets[:, 1:2]) - oy) / res).astype(np.int32)
+        ok = (gx >= 0) & (gx < n) & (gy >= 0) & (gy < n)
+        vals = np.where(ok, field[np.clip(gy, 0, n - 1), np.clip(gx, 0, n - 1)], 0.0)
+        return vals.mean(axis=1)
+
+    def _gauss_newton(self, field, pts, pose, iters=4):
+        """Hector-style refinement: minimise sum (1 - M(S(xi)))^2 on the bilinear field."""
+        ox, oy = self.origin
+        n = field.shape[0]
+        x, y, th = pose
+        for _ in range(iters):
+            c, s = math.cos(th), math.sin(th)
+            wx = x + c * pts[:, 0] - s * pts[:, 1]
+            wy = y + s * pts[:, 0] + c * pts[:, 1]
+            gx = (wx - ox) / self.RES + n / 2 - 0.5
+            gy = n / 2 - (wy - oy) / self.RES - 0.5
+            ok = (gx >= 0) & (gx < n - 1) & (gy >= 0) & (gy < n - 1)
+            if ok.sum() < 20:
+                break
+            gx, gy = gx[ok], gy[ok]
+            px, py = pts[ok, 0], pts[ok, 1]
+            x0, y0 = np.floor(gx).astype(np.int32), np.floor(gy).astype(np.int32)
+            fx, fy = gx - x0, gy - y0
+            m00, m10 = field[y0, x0], field[y0, x0 + 1]
+            m01, m11 = field[y0 + 1, x0], field[y0 + 1, x0 + 1]
+            m = (1 - fy) * ((1 - fx) * m00 + fx * m10) + fy * ((1 - fx) * m01 + fx * m11)
+            dmdgx = (1 - fy) * (m10 - m00) + fy * (m11 - m01)
+            dmdgy = (1 - fx) * (m01 - m00) + fx * (m11 - m10)
+            dmdx = dmdgx / self.RES                 # world x grows with grid x
+            dmdy = -dmdgy / self.RES                # world y grows against grid y
+            dth = dmdx * (-s * px - c * py) + dmdy * (c * px - s * py)
+            J = np.stack([dmdx, dmdy, dth], axis=1)
+            H = J.T @ J + np.diag([1e-3, 1e-3, 1e-4])
+            g = J.T @ (1.0 - m)
+            try:
+                d = np.linalg.solve(H, g)
+            except np.linalg.LinAlgError:
+                break
+            d[:2] = np.clip(d[:2], -0.05, 0.05)
+            d[2] = float(np.clip(d[2], -0.05, 0.05))
+            x, y, th = x + float(d[0]), y + float(d[1]), wrap(th + float(d[2]))
+            if abs(d[0]) < 1e-3 and abs(d[1]) < 1e-3 and abs(d[2]) < 1e-3:
+                break
+        return (x, y, th)
 
     def _localize(self, pts_robot, pose):
-        occ = (self.grid > 1.2).astype(np.float32)
-        if occ.sum() < 150 or self.scans < self.WARMUP_SCANS or len(pts_robot) < 30:
+        """Returns the scan-matched pose, or the prior when the match is not trustworthy."""
+        self.loc_ok = False
+        if len(pts_robot) < 30 or self.origin is None:
             return pose
-        field = cv2.GaussianBlur(occ, (0, 0), 1.6)
-        field /= max(field.max(), 1e-6)
-        sub = pts_robot[:: max(1, len(pts_robot) // 120)]
-        best, best_score, zero_score = (0.0, 0.0, 0.0), -1.0, 0.0
-        for dth in (-0.07, -0.035, 0.0, 0.035, 0.07):
-            yaw = pose[2] + dth
-            c, s = math.cos(yaw), math.sin(yaw)
-            wx0 = pose[0] + c * sub[:, 0] - s * sub[:, 1]
-            wy0 = pose[1] + s * sub[:, 0] + c * sub[:, 1]
-            for dx in (-0.10, -0.05, 0.0, 0.05, 0.10):
-                for dy in (-0.10, -0.05, 0.0, 0.05, 0.10):
-                    gx, gy = self._cell(wx0 + dx, wy0 + dy)
-                    ok = (gx >= 0) & (gx < self.N) & (gy >= 0) & (gy < self.N)
-                    if ok.sum() < 20:
-                        continue
-                    score = float(field[gy[ok], gx[ok]].sum() / len(sub))
-                    score -= 0.02 * (abs(dx) + abs(dy)) / 0.05 + 0.01 * abs(dth) / 0.035
-                    if dx == 0.0 and dy == 0.0 and dth == 0.0:
-                        zero_score = score
-                    if score > best_score:
-                        best, best_score = (dx, dy, dth), score
+        pyr = self._field()
+        if pyr is None:
+            return pose
+        sub = pts_robot[:: max(1, len(pts_robot) // 150)].astype(np.float32)
+        win = float(Config_get("SLAM_SEARCH_XY_M", 0.30))
+        ywin = math.radians(float(Config_get("SLAM_SEARCH_YAW_DEG", 15.0)))
+        prior_score = float(self._score_grid(pyr[0], 1, sub, pose, np.zeros((1, 2), np.float32))[0])
+
+        # coarse: level 1 (0.10 m) over the whole window, 1.5 degree yaw steps
+        step = self.RES * 2
+        k = int(math.ceil(win / step))
+        g = np.arange(-k, k + 1, dtype=np.float32) * step
+        offs = np.stack(np.meshgrid(g, g), axis=-1).reshape(-1, 2)
+        cands = []
+        for dth in np.arange(-ywin, ywin + 1e-9, math.radians(1.5)):
+            p = (pose[0], pose[1], wrap(pose[2] + float(dth)))
+            sc = self._score_grid(pyr[1], 2, sub, p, offs)
+            # gentle preference for the motion prior so a featureless corridor does not slide
+            sc = sc - 0.04 * (np.hypot(offs[:, 0], offs[:, 1]) / max(win, 1e-3)) - 0.03 * abs(float(dth)) / max(ywin, 1e-3)
+            top = np.argsort(sc)[-3:]
+            cands += [(float(sc[i]), float(offs[i, 0]), float(offs[i, 1]), float(dth)) for i in top]
+        cands.sort(reverse=True)
+
+        # fine: level 0 (0.05 m) around the best coarse candidates, 0.5 degree yaw steps
+        fg = np.arange(-2, 3, dtype=np.float32) * self.RES
+        foffs = np.stack(np.meshgrid(fg, fg), axis=-1).reshape(-1, 2)
+        best, best_score = None, -1.0
+        for _, dx, dy, dth in cands[:4]:
+            for ddth in np.radians([-1.0, -0.5, 0.0, 0.5, 1.0]):
+                p = (pose[0] + dx, pose[1] + dy, wrap(pose[2] + dth + float(ddth)))
+                sc = self._score_grid(pyr[0], 1, sub, p, foffs)
+                i = int(np.argmax(sc))
+                if sc[i] > best_score:
+                    best_score = float(sc[i])
+                    best = (p[0] + float(foffs[i, 0]), p[1] + float(foffs[i, 1]), p[2])
+        if best is None:
+            return pose
+        refined = self._gauss_newton(pyr[0], sub, best)
+        ref_score = float(self._score_grid(pyr[0], 1, sub, refined, np.zeros((1, 2), np.float32))[0])
+        if ref_score >= best_score:
+            best, best_score = refined, ref_score
         self.loc_score = best_score
-        if best_score < 0.25 or best_score - zero_score < 0.03:
+        # accept only a clearly good match that is at least as good as where the prior already is
+        if best_score < float(Config_get("SLAM_MIN_SCORE", 0.35)) or best_score < prior_score - 0.01:
+            self.loc_score = max(best_score, prior_score)
             return pose
-        k = 0.6  # damped, so one bad match cannot throw the pose
-        self.loc_shift += k * math.hypot(best[0], best[1])
-        return (pose[0] + k * best[0], pose[1] + k * best[1], wrap(pose[2] + k * best[2]))
+        self.loc_ok = True
+        self.loc_shift += math.hypot(best[0] - pose[0], best[1] - pose[1])
+        return best
+
+    def _recenter(self, pose):
+        """Keep the robot inside the fixed-size grid: shift contents (and origin) in whole cells."""
+        if self.origin is None:
+            return
+        margin = float(Config_get("SLAM_RECENTER_M", 2.5))
+        half = self.N * self.RES / 2
+        dx, dy = pose[0] - self.origin[0], pose[1] - self.origin[1]
+        if abs(dx) < half - margin and abs(dy) < half - margin:
+            return
+        sx, sy = int(round(dx / self.RES)), int(round(dy / self.RES))
+        shifted = np.zeros_like(self.grid)
+        # world +x is grid +col, world +y is grid -row
+        src = self.grid
+        h = w = self.N
+        r0, c0 = max(0, -sy), max(0, sx)       # rows/cols of src that survive
+        r1, c1 = min(h, h - sy), min(w, w + sx)
+        if r0 < r1 and c0 < c1:
+            shifted[r0 + sy:r1 + sy, c0 - sx:c1 - sx] = src[r0:r1, c0:c1]
+        self.grid = shifted
+        self.origin = (self.origin[0] + sx * self.RES, self.origin[1] + sy * self.RES)
+        self.recenters += 1
 
     # --- update ---
 
-    def update(self, bins_mm, odom):
+    def update(self, bins_mm, odom, person=None, pose_src=None):
+        """bins_mm: 360 ranges in mm (0 = no return). odom: (x, y, yaw) or None.
+        person: owner position (x, y) in the robot frame, kept out of the map. pose_src: 'odom' (default when
+        odom is given) or 'slam' (odom is already a map-frame pose from slam_toolbox / Cartographer)."""
         now = time.time()
         if self.stamp:
             self.dt_avg = 0.8 * self.dt_avg + 0.2 * (now - self.stamp)
@@ -291,10 +440,23 @@ class LidarMap:
         self.bins = to_meters(bins_mm)
         if odom is not None and not all(math.isfinite(v) for v in odom):
             odom = None                      # a NaN here would poison the pose, the trail and every later render
+        if odom is None:
+            src = "scan"
+        elif pose_src == "slam" and Config_get("SLAM_USE_EXTERNAL", True):
+            src = "slam"
+        else:
+            src = "odom"
+        if self.source is not None and src != self.source:
+            # a different frame: odometry and the SLAM map frame do not line up, so start a fresh map
+            self.reset()
+            self.resets += 1
+        self.source = src
         prev = self.pose_odom
         if odom is not None and prev is not None:
             jump = math.hypot(odom[0] - prev[0], odom[1] - prev[1])
-            if jump > 0.6 or abs(wrap(odom[2] - prev[2])) > math.radians(70):
+            # slam_toolbox may correct by more than odometry ever jumps (loop closure): allow it a wider gate
+            lim, ylim = (0.6, math.radians(70)) if src == "odom" else (1.5, math.radians(120))
+            if jump > lim or abs(wrap(odom[2] - prev[2])) > ylim:
                 # The robot cannot do that between two scans: odometry restarted (Pi or driver rebooted).
                 # The old map is in a different frame, so start a new one instead of smearing both together.
                 self.reset()
@@ -306,27 +468,61 @@ class LidarMap:
         pts_robot = np.stack([self.bins[hit] * np.cos(ang_r[hit]), self.bins[hit] * np.sin(ang_r[hit])], axis=1)
         self.clusters = segment(self.bins)
 
-        if odom is None:
-            self.pose = None
-            self.grid[:] = 0.0
-            self.labels = ["static"] * len(self.clusters)
-            return
-        if self.origin is None:
-            self.origin = (odom[0], odom[1])
-        pose = self._corrected(odom)
-        if len(pts_robot):
-            pose = self._localize(pts_robot, pose)
+        last = self.pose
+        if src == "slam":
+            if self.origin is None:
+                self.origin = (odom[0], odom[1])
+            pose = tuple(odom)
+            self.loc_ok, self.loc_score = True, 1.0
+        elif src == "odom":
+            if self.origin is None:
+                self.origin = (odom[0], odom[1])
+            pose = self._corrected(odom)
+            if len(pts_robot) and self.scans >= self.WARMUP_SCANS:
+                pose = self._localize(pts_robot, pose)
             # fold the improvement back into T so the next odom sample starts from it
             tth = wrap(pose[2] - odom[2])
             c, s = math.cos(tth), math.sin(tth)
             self.T = (pose[0] - (c * odom[0] - s * odom[1]), pose[1] - (s * odom[0] + c * odom[1]), tth)
+        else:
+            # no odometry: scan matching is the odometry. Prior = last pose moved by the last pose change.
+            if self.origin is None or last is None:
+                self.origin = self.origin or (0.0, 0.0)
+                pose = (0.0, 0.0, 0.0) if last is None else last
+            else:
+                vx, vy, vth = self.vel
+                pose = self._localize(pts_robot, (last[0] + vx, last[1] + vy, wrap(last[2] + vth)))
+                if not self.loc_ok:
+                    pose = last      # nothing better than standing still: never integrate a guessed pose
+        if last is not None and src != "slam":
+            d = (pose[0] - last[0], pose[1] - last[1], wrap(pose[2] - last[2]))
+            self.vel = tuple(0.5 * a + 0.5 * b for a, b in zip(self.vel, d))
         self.pose = pose
+        self._recenter(pose)
         if not self.trail or math.hypot(pose[0] - self.trail[-1][0], pose[1] - self.trail[-1][1]) > 0.08:
             self.trail.append(pose[:2])
             self.trail = self.trail[-400:]
 
         self._classify(pose)
-        self._integrate(pose, ang_r, hit)
+        # A new object that stays put (a box set down, a door closed) is static after ~8 scans and is mapped;
+        # a walking person never stays in one 0.3 m bucket that long.
+        c, s = math.cos(pose[2]), math.sin(pose[2])
+        seen = {}
+        for i, (cl, label) in enumerate(zip(self.clusters, self.labels)):
+            if label != "moving":
+                continue
+            key = (int(math.floor((pose[0] + c * cl["cx"] - s * cl["cy"]) / 0.3)),
+                   int(math.floor((pose[1] + s * cl["cx"] + c * cl["cy"]) / 0.3)))
+            seen[key] = self._persist.get(key, 0) + 1
+            if seen[key] >= 8:
+                self.labels[i] = "static"
+        self._persist = seen
+        self.dynamic = [label == "moving" or (person is not None and
+                        math.hypot(cl["cx"] - person[0], cl["cy"] - person[1]) < 0.6)
+                        for cl, label in zip(self.clusters, self.labels)]
+        # scan-only mapping trusts a match only once something is mapped; a bad match is never integrated
+        if src != "scan" or self.loc_ok or self.scans < 3:
+            self._integrate(pose, ang_r, hit)
         self.scans += 1
 
     def _classify(self, pose):
@@ -367,6 +563,12 @@ class LidarMap:
         cv2.fillPoly(free, [poly], 1)
         self.grid[free > 0] -= 0.30
 
+        # people and moving objects are not walls: their returns clear free space but never mark it occupied,
+        # so the planner does not route round where the owner stood a second ago
+        hit = hit.copy()
+        for cl, dyn in zip(self.clusters, self.dynamic):
+            if dyn:
+                hit[cl["idx"]] = False
         hx, hy = pose[0] + np.cos(yaw_ang) * self.bins, pose[1] + np.sin(yaw_ang) * self.bins
         hgx, hgy = self._cell(np.where(hit, hx, 0.0), np.where(hit, hy, 0.0))
         occ = np.zeros((self.N, self.N), dtype=np.uint8)
@@ -393,7 +595,7 @@ class LidarMap:
 
     # --- rendering ---
 
-    def render(self, person=None, sec=None, plan=None):
+    def render(self, person=None, sec=None, plan=None, hfov_deg=None, cam_yaw_deg=0.0):
         V = self.VIEW
         S = V / (2 * self.VIEW_RADIUS_M)
         cx = cy = V / 2.0
@@ -422,6 +624,18 @@ class LidarMap:
 
         def to_view(xf, yl):
             return int(cx - yl * S), int(cy - xf * S)
+
+        # camera field of view: what the camera can see, so LiDAR-only tracking is visibly "outside the picture"
+        if hfov_deg:
+            ov = view.copy()
+            a0, a1 = math.radians(cam_yaw_deg - hfov_deg / 2), math.radians(cam_yaw_deg + hfov_deg / 2)
+            fov = [to_view(0, 0)] + [to_view(4.0 * math.cos(a), 4.0 * math.sin(a)) for a in np.linspace(a0, a1, 12)]
+            cv2.fillPoly(ov, [np.array(fov, dtype=np.int32)], (90, 70, 40))
+            view = cv2.addWeighted(ov, 0.25, view, 0.75, 0)
+            for a in (a0, a1):
+                cv2.line(view, to_view(0, 0), to_view(4.0 * math.cos(a), 4.0 * math.sin(a)), (150, 120, 70), 1, cv2.LINE_AA)
+            cv2.putText(view, "CAMERA", to_view(1.2, 0.05 + 1.2 * math.tan(min(a1, 1.2))), cv2.FONT_HERSHEY_SIMPLEX, 0.36,
+                        (180, 150, 100), 1, cv2.LINE_AA)
 
         # sectors first so the points sit on top
         if sec is not None:
@@ -488,6 +702,15 @@ class LidarMap:
 
         if person:
             p = to_view(person["x"], person["y"])
+            cov = person.get("cov")
+            if cov:
+                # 2-sigma EKF position ellipse. View axes: u = -y, v = -x, so Pv = A P A^T with A = [[0,-1],[-1,0]].
+                Pv = np.array([[cov[2], cov[1]], [cov[1], cov[0]]])
+                ev, evec = np.linalg.eigh(Pv)                       # ascending
+                sd = 2.0 * np.sqrt(np.clip(ev, 1e-6, 4.0))
+                ang = math.degrees(math.atan2(evec[1, 1], evec[0, 1]))  # major axis, image convention (y down)
+                axes = (max(2, int(sd[1] * S)), max(2, int(sd[0] * S)))
+                cv2.ellipse(view, p, axes, ang, 0, 360, (60, 220, 255), 1, cv2.LINE_AA)
             cv2.circle(view, p, int(0.24 * S), C_PERSON, 2, cv2.LINE_AA)
             tip = to_view(person["x"] + person["vx"], person["y"] + person["vy"])
             cv2.arrowedLine(view, p, tip, (60, 220, 255), 2, cv2.LINE_AA, tipLength=0.3)
@@ -497,8 +720,11 @@ class LidarMap:
         age = time.time() - self.stamp if self.stamp else None
         label = "LiDAR LDS-02  %.0f Hz" % self.hz if age is not None and age < 1.0 else "LiDAR: no data"
         cv2.putText(view, label, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (230, 230, 230), 1, cv2.LINE_AA)
-        if self.pose is None and self.stamp:
-            cv2.putText(view, "no odometry: current scan only", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.4, C_MOVING, 1, cv2.LINE_AA)
+        if self.stamp and self.source:
+            src = {"slam": "SLAM pose from Pi (slam_toolbox)", "odom": "odometry + scan matching",
+                   "scan": "scan matching only (no odometry)"}[self.source]
+            col = (120, 230, 120) if self.loc_ok or self.source == "slam" else (60, 180, 255)
+            cv2.putText(view, f"{src}  match {self.loc_score:.2f}", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.4, col, 1, cv2.LINE_AA)
         for i, (name, col) in enumerate((("person", C_PERSON), ("moving object", C_MOVING), ("static obstacle", C_STATIC), ("wall", C_WALL))):
             cv2.circle(view, (14, V - 14 - 16 * i), 4, col, -1, cv2.LINE_AA)
             cv2.putText(view, name, (24, V - 10 - 16 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (200, 200, 200), 1, cv2.LINE_AA)
