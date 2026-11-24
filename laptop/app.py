@@ -22,9 +22,10 @@ from flask import Flask, render_template, Response, jsonify, request
 from config import Config
 from video_streamer import VideoStreamer
 from cv_worker import run_cv
-from lidar import LidarMap, sectors as lidar_sectors
+from lidar import LidarMap, sectors as lidar_sectors, orient_bins as lidar_orient
 from navigation import Planner, PersonMemory, plan_with_memory
 import cv2
+import numpy as np
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 app = Flask(
@@ -83,7 +84,8 @@ _TELEM_KEYS = (
     "safety_alerts", "phase2_cmd_vel", "obstacle_distances", "nav_status",
     "robot_telemetry", "events", "overlay", "pose_fps", "calibration", "following_enabled",
     "person", "fusion", "reid", "lidar_cam", "camera", "control", "safety_latched", "ambiguous",
-    "video_lost", "settings",
+    "video_lost", "settings", "mirror_suspect", "hand_raised", "hold_to_follow", "sensor_fault",
+    "tracking_confidence", "follow_state",
 )
 
 lidar_map = LidarMap()
@@ -94,6 +96,11 @@ lidar_lock = threading.Lock()
 lidar_jpeg = None
 lidar_cond = threading.Condition(lidar_lock)
 lidar_seq = 0
+lidar_view_clients = 0          # the OpenCV map is only drawn while someone watches /stream/lidar
+scene_cond = threading.Condition()
+scene_json = None               # RViz-style scene for the browser, 10 Hz
+scene_seq = 0
+map_png = (None, -1)            # (bytes, scans) cache for /api/map.png
 
 
 def _bump():
@@ -194,6 +201,8 @@ def _lidar_step(last, last_render):
         now = time.time()
         if scan is not None and count != last:
             last = count
+            if Config.LIDAR_MIRROR or Config.LIDAR_YAW_DEG:
+                scan = dict(scan, bins=lidar_orient(scan["bins"], Config.LIDAR_MIRROR, Config.LIDAR_YAW_DEG))
             try:
                 cmd_q.put_nowait({"op": "lidar", "wait": False, "bins": scan["bins"]})
             except Exception:
@@ -216,8 +225,11 @@ def _lidar_step(last, last_render):
                     if person:
                         ex = (math.radians(person["bearing_deg"]), 0.25, person["range"])
                     sec = lidar_sectors(lidar_map.bins, exclude=ex)
-                view = lidar_map.render(person=person, sec=sec, plan=latest_plan, hfov_deg=Config.CAMERA_HFOV_DEG,
-                                        cam_yaw_deg=camera.get("yaw_deg", 0.0))
+                view = None
+                if lidar_view_clients > 0:
+                    view = lidar_map.render(person=person, sec=sec, plan=latest_plan, hfov_deg=Config.CAMERA_HFOV_DEG,
+                                            cam_yaw_deg=camera.get("yaw_deg", 0.0))
+                scene = _build_scene(person, camera)
                 loc = None
                 if lidar_map.pose is not None:
                     loc = {"x": round(lidar_map.pose[0] - lidar_map.origin[0], 2), "y": round(lidar_map.pose[1] - lidar_map.origin[1], 2),
@@ -233,7 +245,8 @@ def _lidar_step(last, last_render):
                 latest_telemetry["plan_status"] = (("MEMORY " if lp.get("memory") else "") + lp.get("status", "--")) if lp else "--"
                 latest_telemetry["memory_age"] = round(lp["age"], 1) if lp.get("memory") else None
                 _bump()
-            ok, buf = cv2.imencode(".jpg", view, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            _publish_scene(scene)
+            ok, buf = cv2.imencode(".jpg", view, [cv2.IMWRITE_JPEG_QUALITY, 80]) if view is not None else (False, None)
             if ok:
                 with lidar_cond:
                     lidar_jpeg = buf.tobytes()
@@ -242,8 +255,104 @@ def _lidar_step(last, last_render):
     return last, last_render
 
 
-def generate_lidar_stream():
+def _build_scene(person, camera):
+    """Everything the RViz-style view draws, in the map frame (metres). Caller holds lidar_lock."""
+    m = lidar_map
+    if m.pose is None or m.origin is None:
+        return {"ok": False, "stamp": time.time(), "hz": round(m.hz, 1)}
+    px, py, yaw = m.pose
+    c, s_ = math.cos(yaw), math.sin(yaw)
+
+    def to_map(x, y):
+        return (round(px + c * x - s_ * y, 3), round(py + s_ * x + c * y, 3))
+
+    pts = []
+    if m.bins is not None:
+        ang = (np.arange(len(m.bins)) + 0.5) * (2 * math.pi / len(m.bins))
+        kind = np.zeros(len(m.bins), dtype=np.int8)          # 0 static, 1 wall, 2 moving, 3 person
+        for cl, label in zip(m.clusters, m.labels):
+            k = {"wall": 1, "moving": 2}.get(label, 0)
+            if person and math.hypot(cl["cx"] - person["x"], cl["cy"] - person["y"]) < 0.6:
+                k = 3
+            kind[cl["idx"]] = k
+        for i in np.nonzero(np.isfinite(m.bins))[0]:
+            r = float(m.bins[i])
+            pts.append([*to_map(r * math.cos(ang[i]), r * math.sin(ang[i])), int(kind[i])])
+    pers = None
+    if person:
+        cx, cy = to_map(person["x"], person["y"])
+        vx, vy = c * person["vx"] - s_ * person["vy"], s_ * person["vx"] + c * person["vy"]
+        cov = person.get("cov")
+        if cov:   # rotate the robot-frame covariance into the map frame: R P R^T
+            P = np.array([[cov[0], cov[1]], [cov[1], cov[2]]])
+            R = np.array([[c, -s_], [s_, c]])
+            Pm = R @ P @ R.T
+            cov = [float(Pm[0, 0]), float(Pm[0, 1]), float(Pm[1, 1])]
+        pers = {"x": cx, "y": cy, "vx": round(vx, 3), "vy": round(vy, 3), "cov": cov,
+                "range": round(person.get("range", 0.0), 2)}
+    lp = latest_plan or {}
+    return {
+        "ok": True, "stamp": time.time(), "hz": round(m.hz, 1), "frame": "map",
+        "pose": [round(px, 3), round(py, 3), round(yaw, 4)],
+        "map": {"origin": [m.origin[0], m.origin[1]], "res": m.RES, "n": m.N, "scans": m.scans},
+        "source": m.source, "score": round(m.loc_score, 2), "loc_ok": m.loc_ok,
+        "scan": pts, "person": pers,
+        "trail": [[round(x, 2), round(y, 2)] for x, y in m.trail[-300:]],
+        "path": [[round(x, 2), round(y, 2)] for x, y in (lp.get("path") or [])],
+        "goal": lp.get("goal"), "plan_status": lp.get("status"), "memory": bool(lp.get("memory")),
+        "last_seen": lp.get("mem_world"),
+        "fov": {"hfov_deg": Config.CAMERA_HFOV_DEG, "yaw_deg": camera.get("yaw_deg", 0.0)},
+    }
+
+
+def _publish_scene(scene):
+    global scene_json, scene_seq
+    payload = json.dumps(scene)
+    with scene_cond:
+        scene_json = payload
+        scene_seq += 1
+        scene_cond.notify_all()
+
+
+def generate_scene_events():
     last = -1
+    try:
+        while True:
+            with scene_cond:
+                if scene_seq == last:
+                    scene_cond.wait(1.0)
+                seq, payload = scene_seq, scene_json
+            if payload is None or seq == last:
+                continue
+            last = seq
+            yield "data: " + payload + "\n\n"
+    except (GeneratorExit, BrokenPipeError, ConnectionResetError):
+        pass
+
+
+def _map_png():
+    """Occupancy grid as an RGBA PNG in RViz 'map' colours: free light grey, occupied black, unknown transparent.
+    Row 0 is the +y edge of the grid (image top = north), column 0 the -x edge."""
+    global map_png
+    with lidar_lock:
+        if map_png[0] is not None and lidar_map.scans - map_png[1] < 5 and lidar_map.scans >= map_png[1]:
+            return map_png[0]
+        g = lidar_map.grid.copy()
+        scans = lidar_map.scans
+        origin = lidar_map.origin or (0.0, 0.0)
+    img = np.zeros((g.shape[0], g.shape[1], 4), dtype=np.uint8)
+    img[g < -0.3] = (205, 205, 205, 235)       # BGRA for cv2
+    img[g > 0.9] = (0, 0, 0, 255)
+    ok, buf = cv2.imencode(".png", img)
+    data = (buf.tobytes() if ok else b"", origin, lidar_map.RES, g.shape[0])
+    map_png = (data, scans)
+    return data
+
+
+def generate_lidar_stream():
+    global lidar_view_clients
+    last = -1
+    lidar_view_clients += 1
     try:
         while True:
             with lidar_cond:
@@ -257,6 +366,8 @@ def generate_lidar_stream():
                    + b"\r\n\r\n" + jpg + b"\r\n")
     except (GeneratorExit, BrokenPipeError, ConnectionResetError):
         pass
+    finally:
+        lidar_view_clients -= 1
 
 
 def _read_pose():
@@ -395,6 +506,21 @@ def stream_lidar():
                     headers={"Cache-Control": "no-store"})
 
 
+@app.route("/api/scene")
+def api_scene():
+    return Response(generate_scene_events(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+
+@app.route("/api/map.png")
+def api_map_png():
+    data, origin, res, n = _map_png()
+    # the origin the PNG was drawn at travels with it, so a grid recentre can never misplace the picture
+    return Response(data, mimetype="image/png", headers={
+        "Cache-Control": "no-store", "X-Map-Origin": f"{origin[0]:.4f},{origin[1]:.4f}",
+        "X-Map-Res": str(res), "X-Map-N": str(n), "Access-Control-Expose-Headers": "X-Map-Origin, X-Map-Res, X-Map-N"})
+
+
 @app.route("/api/lidar/reset", methods=["POST"])
 def api_lidar_reset():
     with lidar_lock:
@@ -527,7 +653,8 @@ def _apply_settings(values):
     limits = {"DESIRED_DISTANCE": (Config.MIN_FOLLOW_DISTANCE, 3.5), "DISTANCE_SCALE": (0.5, 2.0),
               "CAMERA_HFOV_DEG": (30.0, 160.0), "CAM_HEIGHT_M": (0.0, 1.5), "LIDAR_HEIGHT_M": (0.0, 1.0),
               "CAM_X_M": (-0.5, 0.5), "CAM_Y_M": (-0.5, 0.5), "CAM_YAW_DEG": (-45.0, 45.0), "CAM_PITCH_DEG": (-45.0, 45.0),
-              "MAX_LINEAR_VEL": (0.0, 0.26), "MAX_ANGULAR_VEL": (0.0, 2.84)}
+              "MAX_LINEAR_VEL": (0.0, 0.26), "MAX_ANGULAR_VEL": (0.0, 2.84), "LIDAR_YAW_DEG": (-180.0, 180.0),
+              "MAX_ACCEL_ANGULAR": (1.0, 20.0)}
     for name, raw in (values or {}).items():
         name = str(name).upper()
         if name not in Config.TUNABLE:

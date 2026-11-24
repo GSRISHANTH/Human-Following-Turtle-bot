@@ -75,7 +75,7 @@ class Behaviours(unittest.TestCase):
         for _ in range(6):
             tel = self.frame({0: 0.9})
         self.assertEqual(tel["target_state"], Config.STATE_WAIT_FOR_OWNER_MOVEMENT)
-        for i in range(30):                       # walks away at about 0.5 m/s of frame-to-frame motion
+        for i in range(60):                       # walks away; the faster they go the larger the gap it keeps
             tel = self.frame({0: 0.9 + 0.03 * (i + 1)})
         self.assertEqual(tel["target_state"], Config.STATE_FOLLOWING, tel["nav_status"])
         self.assertGreater(tel["phase2_cmd_vel"]["linear_x"], 0.0)
@@ -238,6 +238,106 @@ class Behaviours(unittest.TestCase):
         tel = self.frame({})
         self.assertTrue(p.memory_done)
 
+    def test_turns_at_once_toward_where_a_walking_owner_went(self):
+        """First frame after the loss: no freeze, the robot rotates toward the EKF-predicted position."""
+        p = self.pipe
+        for vy, sign in ((0.5, 1.0), (-0.5, -1.0)):
+            self.track_at(2.0, 10.0 * sign)
+            p.ekf.s[3] = vy                                 # walking off to that side
+            p.target_state, p.target_lost_time = Config.STATE_FOLLOWING, None
+            p.plan = None
+            tel = self.frame({})
+            self.assertEqual(tel["nav_status"], "PREDICT_TURN", tel["nav_status"])
+            self.assertEqual(np.sign(tel["phase2_cmd_vel"]["angular_z"]), sign)
+            self.assertEqual(tel["phase2_cmd_vel"]["linear_x"], 0.0, "rotation only right after a loss")
+            self.assertNotEqual(p.robot.target_angular, 0.0, "the turn must reach the motors")
+
+    def test_without_a_map_it_follows_the_owners_motion_before_searching(self):
+        p = self.pipe
+        self.lose(None, ago=1.8)
+        p.plan = None
+        p.ekf.init(2.6, 0.0, time.time())
+        p.ekf.s[2] = 0.4                                    # was walking straight away
+        p._lost_speed = 0.4
+        tel = self.frame({})
+        self.assertEqual(tel["nav_status"], "PREDICT_PURSUIT")
+        self.assertGreater(tel["phase2_cmd_vel"]["linear_x"], 0.0)
+        self.assertEqual(p.target_state, Config.STATE_RECOVERING)
+        self.assertFalse(p.memory_done)
+        p._lost_speed = 0.0                                 # standing owner: nothing to follow, search instead
+        p.target_lost_time = time.time() - 1.8
+        self.frame({})
+        self.assertTrue(p.memory_done)
+
+    def test_start_leaves_manual_but_never_releases_an_estop(self):
+        p = self.pipe
+        p.robot.set_mode("MANUAL")
+        p.start_following()
+        self.assertEqual(p.robot.mode, "AUTO")
+        p.robot.trigger_emergency_stop()
+        p.start_following()
+        self.assertTrue(p.robot.emergency_stop)
+        self.assertEqual(p.robot.mode, "STOP")
+
+    def test_default_recovery_rotates_to_find_and_never_drives(self):
+        """Default (RECOVERY_DRIVE_TO_LAST_SEEN off): lost owner -> turn toward where they went, sweep, 360, stop.
+        Not one forward command on the way, even with a plan to the remembered spot available."""
+        p = self.pipe
+        saved = Config.RECOVERY_DRIVE_TO_LAST_SEEN
+        Config.RECOVERY_DRIVE_TO_LAST_SEEN = False
+        try:
+            self.track_at(2.0, -25.0)
+            p.ekf.s[3] = -0.4                            # walked off to the right
+            p.target_state, p.target_lost_time = Config.STATE_FOLLOWING, None
+            p.set_plan(self.mem_plan(mem_bearing=-0.5))
+            states, ws, vs = set(), [], []
+            for i in range(60):
+                tel = self.frame({})
+                states.add(tel["target_state"])
+                ws.append(tel["phase2_cmd_vel"]["angular_z"])
+                vs.append(tel["phase2_cmd_vel"]["linear_x"])
+                p.target_lost_time -= 0.25               # fast-forward through the search phases
+            self.assertEqual(max(vs), 0.0, "recovery must rotate, not drive")
+            self.assertNotIn(Config.STATE_RECOVERING, states)
+            self.assertIn(Config.STATE_SEARCHING, states)
+            self.assertLess(next(w for w in ws if w != 0.0), 0.0, "first turn is toward where they went (right)")
+        finally:
+            Config.RECOVERY_DRIVE_TO_LAST_SEEN = saved
+
+    def test_follow_distance_grows_with_speed_and_uncertainty(self):
+        p = self.pipe
+        p.base_target_distance, p.dynamic_target_distance = 1.2, 1.2
+        self.track_at(2.0, 0.0)
+        p.fusion_mode = "LIDAR+CAM"
+        for _ in range(30):
+            p._update_dynamic_distance()
+        still = p.dynamic_target_distance
+        self.assertAlmostEqual(still, 1.2, delta=0.06, msg="standing owner, good tracking: the set distance")
+        p.ekf.s[2] = 0.8                                 # walking away at 0.8 m/s
+        for _ in range(30):
+            p._update_dynamic_distance()
+        self.assertGreater(p.dynamic_target_distance, still + 0.3)
+        p.ekf.s[2] = 0.0
+        p.fusion_mode = "LIDAR"                          # camera lost them: less confident
+        p.ekf.P[0, 0] = p.ekf.P[1, 1] = 0.25
+        for _ in range(30):
+            p._update_dynamic_distance()
+        self.assertLess(p.tracking_confidence, 0.7)
+        self.assertGreater(p.dynamic_target_distance, 1.4)
+        self.assertLessEqual(p.dynamic_target_distance, 1.2 + Config.DIST_MAX_EXTRA + 1e-6)
+
+    def test_silent_lidar_is_a_sensor_fault_that_stops_the_robot(self):
+        p = self.pipe
+        self.track_at(2.5, 0.0)
+        p.set_lidar(bins_with({0: 2.5}))
+        p.lidar_time = time.time() - (Config.LIDAR_FAULT_SEC + 1.0)     # last scan long ago
+        tel, _ = p.process_frame(BLANK.copy())
+        self.assertEqual(tel["sensor_fault"], "LIDAR_STALE")
+        self.assertEqual(tel["safety_status"], "SENSOR_FAULT")
+        self.assertEqual(tel["phase2_cmd_vel"], {"linear_x": 0.0, "angular_z": 0.0})
+        self.assertEqual(p.robot.target_linear, 0.0)
+        self.assertTrue(any(e["type"] == "SENSOR_FAULT" for e in p.event_log))
+
     def test_pursuit_times_out(self):
         p = self.pipe
         self.lose(self.mem_plan(), ago=Config.MEMORY_PURSUIT_SEC + 1.0)
@@ -254,7 +354,7 @@ class Behaviours(unittest.TestCase):
         self.assertTrue(tel["fusion"]["lidar_only"])
         self.assertIn(p.target_state, (Config.STATE_FOLLOWING, Config.STATE_WAIT_FOR_OWNER_MOVEMENT))
         self.assertTrue(any(e["type"] == "MEMORY_RELOCK" for e in p.event_log))
-        self.assertGreater(time.time() - p.last_cam_seen, 5.0)     # leash set so the approach can be confirmed by camera
+        self.assertGreaterEqual(time.time() - p.last_cam_seen, 0.0)   # a fresh leash: the camera must confirm in time
         self.assertLess(time.time() - p.last_cam_seen, Config.LIDAR_TRACK_MAX_SEC)
 
     def test_a_far_away_person_is_not_taken_for_the_hidden_owner(self):

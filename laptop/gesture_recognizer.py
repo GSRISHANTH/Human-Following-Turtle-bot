@@ -21,6 +21,16 @@ class GestureRecognizer:
         return self.feed(self.classify(landmarks))
 
     @staticmethod
+    def hand_raised(landmarks, margin=0.02):
+        """Hold-to-follow: is either wrist above its own shoulder (image y grows downward)?"""
+        if not landmarks or len(landmarks) < 25:
+            return False
+        sh_l, sh_r, wr_l, wr_r = landmarks[11], landmarks[12], landmarks[15], landmarks[16]
+        left = wr_l.visibility > 0.4 and sh_l.visibility > 0.4 and wr_l.y < sh_l.y - margin
+        right = wr_r.visibility > 0.4 and sh_r.visibility > 0.4 and wr_r.y < sh_r.y - margin
+        return bool(left or right)
+
+    @staticmethod
     def classify(landmarks):
         """One frame, no memory: which gesture these landmarks show ('NONE' if none)."""
         if not landmarks or len(landmarks) < 25:

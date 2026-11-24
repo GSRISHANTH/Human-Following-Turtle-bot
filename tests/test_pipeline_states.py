@@ -40,10 +40,14 @@ def gesture_landmarks(kind, offset_x=0.0):
         lms[16] = create_mock_landmark(cx + 0.14, 0.10)
     elif kind == "FOLLOW_ME":
         lms[16] = create_mock_landmark(cx + 0.15, 0.10)
+    elif kind == "RAISE":                               # hand above the shoulder, below the head
+        lms[16] = create_mock_landmark(cx + 0.15, 0.26)
+        lms[14] = create_mock_landmark(cx + 0.16, 0.36)
     return lms
 
 
-class PipelineStates(unittest.TestCase):
+class _Harness(unittest.TestCase):
+    """Shared pipeline + injected-people harness (no tests of its own)."""
     @classmethod
     def setUpClass(cls):
         cls.pipe = CVPipeline()
@@ -97,6 +101,9 @@ class PipelineStates(unittest.TestCase):
 
     RED, BLUE = (30, 30, 220), (220, 60, 30)
 
+
+
+class PipelineStates(_Harness):
     def test_bystander_cannot_release_the_owner(self):
         tels = self.run_frames(lambda: [self.person(200, self.RED), self.person(460, self.BLUE, "RELEASE")], 10)
         self.assertTrue(self.pipe.owner_enrolled, "a bystander's crossed arms must not release the owner")
@@ -168,6 +175,68 @@ class PipelineStates(unittest.TestCase):
         self.assertAlmostEqual(ov["lidar_m"], 1.8, delta=0.05)
         self.assertTrue(tels[-1]["lidar_cam"], "projected beams must be sent for the overlay")
         self.assertTrue(all(0.0 <= pt[0] <= 1.0 for pt in tels[-1]["lidar_cam"]))
+
+
+class HoldToFollow(_Harness):
+    """Drive only while the owner's hand is up; hand down = stay and keep them centred; search only when the camera
+    loses them (LiDAR-guided first); found again = stop searching, centre, wait for the hand."""
+
+    def setUp(self):
+        super().setUp()
+        self._saved = (Config.FOLLOW_REQUIRES_RAISED_HAND, Config.FOLLOW_RELEASE_SEC)
+        Config.FOLLOW_REQUIRES_RAISED_HAND, Config.FOLLOW_RELEASE_SEC = True, 0.0
+        p = self.pipe
+        p.hand_raised, p._raise_n, p._raised_at_loss = False, 0, False
+        p.memory_done, p.search_t0, p.plan = False, None, None
+
+    def tearDown(self):
+        Config.FOLLOW_REQUIRES_RAISED_HAND, Config.FOLLOW_RELEASE_SEC = self._saved
+        super().tearDown()
+
+    def test_hand_down_stays_and_centres_never_searches(self):
+        tels = self.run_frames(lambda: [self.person(200, self.RED)], 12)
+        self.assertEqual({t["target_state"] for t in tels[2:]}, {Config.STATE_AWAITING_GESTURE})
+        self.assertTrue(all(t["phase2_cmd_vel"]["linear_x"] == 0.0 for t in tels))
+        self.assertGreater(tels[-1]["phase2_cmd_vel"]["angular_z"], 0.0, "owner left of centre: turn left to centre them")
+
+    def test_hand_up_follows_hand_down_stops(self):
+        tels = self.run_frames(lambda: [self.person(320, self.RED, "RAISE")], 6)
+        self.assertEqual(tels[-1]["target_state"], Config.STATE_FOLLOWING)
+        self.assertGreater(tels[-1]["phase2_cmd_vel"]["linear_x"], 0.0)
+        tels = self.run_frames(lambda: [self.person(320, self.RED)], 3)
+        self.assertEqual(tels[-1]["target_state"], Config.STATE_AWAITING_GESTURE)
+        self.assertEqual(tels[-1]["phase2_cmd_vel"]["linear_x"], 0.0)
+        self.assertTrue(self.pipe.owner_enrolled and self.pipe.following_enabled, "lowering the hand is not a pause")
+
+    def test_a_bystanders_raised_hand_does_not_drive(self):
+        tels = self.run_frames(lambda: [self.person(200, self.RED), self.person(460, self.BLUE, "RAISE")], 8)
+        self.assertEqual(tels[-1]["target_state"], Config.STATE_AWAITING_GESTURE)
+        self.assertEqual(tels[-1]["phase2_cmd_vel"]["linear_x"], 0.0)
+
+    def test_out_of_camera_lidar_guides_the_turn_and_never_drives_blind(self):
+        p = self.pipe
+        for raised, drives in ((False, False), (True, False)):
+            p.hand_raised, p.lidar_only = raised, False
+            p.target_state = Config.STATE_FOLLOWING if raised else Config.STATE_AWAITING_GESTURE
+            p.set_lidar(bins_with({-40: 2.4}))             # owner walked off to the right, out of the 57 deg view
+            now = time.time()
+            p.ekf.init(2.4, math.radians(-40), now)
+            p.last_cam_seen = now
+            tels = self.run_frames(lambda: [], 3)
+            self.assertEqual(tels[-1]["target_state"], Config.STATE_LIDAR_GUIDED, tels[-1]["nav_status"])
+            self.assertLess(tels[-1]["phase2_cmd_vel"]["angular_z"], 0.0, "turn right, toward the LiDAR position")
+            self.assertEqual(tels[-1]["phase2_cmd_vel"]["linear_x"] > 0.0, drives)
+
+    def test_found_again_during_search_stops_and_waits_for_the_hand(self):
+        p = self.pipe
+        p.hand_raised = False
+        p.target_state = Config.STATE_SEARCHING
+        p.target_lost_time = time.time() - 5.0
+        p.memory_done = True
+        tels = self.run_frames(lambda: [self.person(150, self.RED)], 4)      # left of centre (frames are 480 wide)
+        self.assertEqual(tels[-1]["target_state"], Config.STATE_AWAITING_GESTURE)
+        self.assertEqual(tels[-1]["phase2_cmd_vel"]["linear_x"], 0.0)
+        self.assertGreater(tels[-1]["phase2_cmd_vel"]["angular_z"], 0.0, "centres the owner instead of sweeping on")
 
 
 class RestoredProfile(unittest.TestCase):

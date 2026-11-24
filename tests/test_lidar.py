@@ -107,6 +107,31 @@ class Map(unittest.TestCase):
         img = m.render(person={"x": 1.0, "y": 0.2, "vx": 0.1, "vy": 0.0}, sec=lidar.sectors(m.bins))
         self.assertEqual(img.shape, (lidar.LidarMap.VIEW, lidar.LidarMap.VIEW, 3))
 
+    def test_orientation_fixes(self):
+        bins = [0] * 360
+        bins[30] = 1500                                   # something 30 deg to the LEFT
+        m = lidar.orient_bins(bins, mirror=True)
+        self.assertEqual(m.index(1500), 329, "mirrored: now 30 deg to the right")
+        r = lidar.orient_bins(bins, yaw_deg=90)
+        self.assertEqual(r.index(1500), 120, "LiDAR zero 90 deg left of forward: the return is at 120 deg")
+        self.assertEqual(lidar.orient_bins(bins), bins)
+
+    def test_box_association_takes_the_person_not_the_wall_behind(self):
+        """Owner at 2.0 m in front of a wall at 3.3 m, camera guesses 2.6 m: the person (nearest, in the box) wins,
+        and a cluster outside the box or far from the camera's range is never taken."""
+        r = np.full(360, np.nan)
+        for i in (358, 359, 0, 1):
+            r[i] = 2.0
+        for i in (350, 351, 352, 353, 354, 6, 7, 8, 9, 10):
+            r[i] = 3.3
+        for i in (40, 41, 42):
+            r[i] = 1.0
+        cl = lidar.segment(r)
+        pc = lidar.box_person_cluster(cl, 0.0, math.radians(8), 2.6)
+        self.assertIsNotNone(pc)
+        self.assertAlmostEqual(pc["range"], 2.0, delta=0.05)
+        self.assertIsNone(lidar.box_person_cluster(cl, 0.0, math.radians(8), 8.0), "nothing within 50% of 8 m")
+
     def test_no_odometry_maps_by_scan_matching_alone(self):
         """Without /odom the map is still built (scan matching is the odometry) and the pose stays defined."""
         from tests.test_navigation import room_scan

@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/css/style.css?v=10">
+    <link rel="stylesheet" href="/static/css/style.css?v=16">
 </head>
 <body>
     {% if hil %}
@@ -100,11 +100,33 @@
                 <div class="video-card-header">
                     <div class="stream-badge">
                         <span class="badge-dot pulse-glow"></span>
-                        <span>LIDAR MAP</span>
+                        <span>MAP &middot; RVIZ VIEW</span>
                     </div>
                     <button id="btn-lidar-reset" class="btn btn-toggle" title="Forget the accumulated map">CLEAR MAP</button>
                 </div>
-                <img id="lidar-img" src="/stream/lidar" alt="2D LiDAR map">
+                <div class="rviz-toolbar" role="group" aria-label="Map displays">
+                    <label><input type="checkbox" id="rv-map" checked> Map</label>
+                    <label><input type="checkbox" id="rv-grid" checked> Grid</label>
+                    <label><input type="checkbox" id="rv-scan" checked> LaserScan</label>
+                    <label><input type="checkbox" id="rv-path" checked> Path</label>
+                    <label><input type="checkbox" id="rv-trail" checked> Odom</label>
+                    <label><input type="checkbox" id="rv-person" checked> Person</label>
+                    <label><input type="checkbox" id="rv-tf" checked> TF</label>
+                    <label><input type="checkbox" id="rv-fov" checked> Camera</label>
+                    <span class="rv-btns">
+                        <button type="button" class="btn btn-toggle" id="rv-follow" title="Keep the robot centred">FOLLOW</button>
+                        <button type="button" class="btn btn-toggle" id="rv-up" title="Rotate so the robot faces up">ROBOT UP</button>
+                        <button type="button" class="btn btn-toggle" id="rv-reset" title="Reset zoom (or double-click the map)">RESET</button>
+                    </span>
+                </div>
+                <canvas id="rviz" aria-label="Top-down map in the map frame: occupancy grid, laser scan, robot, owner and path"></canvas>
+                <div class="rviz-foot"><span id="rviz-status">--</span><span id="rviz-cursor"></span></div>
+                <div class="rviz-legend" aria-hidden="true">
+                    <span><i style="background:#ff3b30"></i>scan</span><span><i style="background:#ffa500"></i>moving</span>
+                    <span><i style="background:#19e619"></i>owner</span><span><i style="background:#19ff00;height:3px"></i>path</span>
+                    <span><i style="background:#00c8ff;height:2px"></i>odom</span><span><i style="background:#ff00ff"></i>goal / last seen</span>
+                    <span><i style="background:#cdcdcd"></i>free</span><span><i style="background:#000;border:1px solid #666"></i>occupied</span>
+                </div>
                 <div class="lh-body">
                     <div class="sector-row">
                         <div class="sector"><span>LEFT</span><b id="sec-left">--</b></div>
@@ -160,7 +182,7 @@
         <section class="analysis-deck">
             <div class="deck-card fsm-card">
                 <div class="card-title"><span>STATE MACHINE</span><span class="card-sub" id="fsm-dwell">--</span></div>
-                <svg id="fsm-svg" viewBox="0 0 696 320" role="img" aria-label="Follow state machine, current state highlighted"></svg>
+                <svg id="fsm-svg" viewBox="0 0 696 392" role="img" aria-label="Follow state machine, current state highlighted"></svg>
                 <div class="fsm-legend" id="fsm-why">--</div>
             </div>
             <div class="deck-card ctl-card">
@@ -361,7 +383,8 @@
         </section>
     </div>
 
-    <script src="/static/js/viz.js?v=10"></script>
-    <script src="/static/js/dashboard.js?v=10"></script>
+    <script src="/static/js/viz.js?v=16"></script>
+    <script src="/static/js/rviz.js?v=16"></script>
+    <script src="/static/js/dashboard.js?v=16"></script>
 </body>
 </html>

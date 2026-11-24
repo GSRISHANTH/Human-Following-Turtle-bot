@@ -31,6 +31,19 @@ SIDE_OUTER_DEG = 80.0
 PERSON_WIDTH = (0.06, 0.80)    # a torso or a pair of legs seen from 1 m: not a wall, not a post
 
 
+def orient_bins(bins, mirror=False, yaw_deg=0.0):
+    """Bring a 360-bin scan into the ROS robot frame: optional left/right mirror (bin i centred at i+0.5 deg
+    maps to -(i+0.5) deg, i.e. bin n-1-i), then a mounting yaw offset (+ = the LiDAR zero points left)."""
+    out = list(bins)
+    n = len(out)
+    if mirror:
+        out = [out[n - 1 - i] for i in range(n)]
+    k = int(round(yaw_deg * n / 360.0)) % n if n else 0
+    if k:
+        out = out[-k:] + out[:-k]          # a return measured at bin j is really at robot bearing j + k
+    return out
+
+
 def to_meters(bins_mm):
     r = np.asarray(bins_mm, dtype=np.float32) / 1000.0
     r[r <= 0.0] = np.nan
@@ -117,6 +130,25 @@ def person_cluster(clusters, bearing, near, window_deg=9.0):
         cost = dr + 1.5 * db
         if dr < 0.7 and cost < best_cost:
             best, best_cost = c, cost
+    return best
+
+
+def box_person_cluster(clusters, bearing, half_rad, cam_range, tol=0.5):
+    """The LiDAR cluster that is the person inside a camera box: person-sized, bearing inside the box (+2 deg),
+    range within tol of the camera's own (unscaled) estimate, and the NEAREST such cluster, because in a 2-D scan
+    the person's legs occlude whatever stands behind them. A fixed bearing window plus 'closest to the current
+    estimate' instead locks onto a wall behind the person and then drags the estimate (and the camera scale) there."""
+    best = None
+    win = half_rad + math.radians(2.0)
+    for c in clusters:
+        if not (PERSON_WIDTH[0] <= c["width"] <= PERSON_WIDTH[1]):
+            continue
+        if abs(wrap(c["bearing"] - bearing)) > win:
+            continue
+        if cam_range > 0 and abs(c["range"] - cam_range) > tol * cam_range:
+            continue
+        if best is None or c["range"] < best["range"]:
+            best = c
     return best
 
 

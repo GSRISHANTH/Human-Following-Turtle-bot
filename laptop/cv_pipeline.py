@@ -72,6 +72,10 @@ class CVPipeline:
         self.ambiguous = False        # two look-alikes in view: hold still, never guess and never search
         self.render_hud = True        # the dashboard draws in the browser; the worker turns the OpenCV HUD off
         self.lidar_cam = []           # LiDAR beams projected into the image, for the co-mapped overlay
+        self.hand_raised = False      # hold-to-follow: owner's hand is up (debounced)
+        self._raise_n = 0
+        self._last_raise_t = 0.0
+        self._raised_at_loss = False  # was the hand up when the camera lost the owner (then keep up by LiDAR)
         self.search_t0 = None         # when the scan search began; it starts after the memory pursuit, not at the loss
         
         # Target Tracking State
@@ -93,8 +97,9 @@ class CVPipeline:
         self.owner_match_score = 1.0 if self.owner_enrolled else 0.0
         self.last_candidates = []
         if self.owner_enrolled:
-            # A profile from an earlier run is a convenience, not a command: never start driving on boot.
-            self.following_enabled = False
+            # A profile from an earlier run is a convenience, not a command: never start driving on boot. With
+            # hold-to-follow nothing moves until the owner raises a hand, so following can stay armed.
+            self.following_enabled = bool(Config.FOLLOW_REQUIRES_RAISED_HAND)
             self.target_state = Config.STATE_OWNER_LOCKED
             print("[CVPipeline] Loaded designated Owner biometric profile.")
         
@@ -240,6 +245,8 @@ class CVPipeline:
         self.target_lost_time = None
         self.lidar_only = False
         self.target_state = Config.STATE_OWNER_RELEASED
+        self._released_t = time.time()
+        self.last_cam_seen = None
         self.robot.update_auto_commands(0.0, 0.0, can_move=False)
         if os.path.exists(self.owner_profile_file):
             try:
@@ -259,6 +266,9 @@ class CVPipeline:
             self._log_event("SAFETY_CLEARED", "Stop latch cleared. Following may resume.")
         self.safety_latched = False
         self.following_enabled = True
+        if self.robot.mode == "MANUAL" and not self.robot.emergency_stop:
+            self.robot.set_mode("AUTO")
+            self._log_event("MODE_AUTO", "Teleop mode left: autonomous following is driving again.")
         if self.owner_enrolled:
             self.target_state = Config.STATE_FOLLOWING
         self._log_event("FOLLOWING_STARTED", "Autonomous following enabled by operator.")
@@ -278,7 +288,7 @@ class CVPipeline:
         """Pauses following while keeping owner locked"""
         self.following_enabled = False
         if self.owner_enrolled:
-            self.target_state = Config.STATE_WAIT_FOR_OWNER_MOVEMENT
+            self.target_state = Config.STATE_PAUSED
         self.robot.update_auto_commands(0.0, 0.0, can_move=False)
         self._log_event("FOLLOWING_PAUSED", "Autonomous following paused. Robot stationary.")
         return True
@@ -304,7 +314,7 @@ class CVPipeline:
         beat all of that, and is logged as REID_REJECTED."""
         app = cand.get("similarity_to_owner", 0.0)
         lost = (self.target_lost_time is not None
-                or self.target_state in (Config.STATE_SEARCHING, Config.STATE_TARGET_TEMPORARILY_LOST,
+                or self.target_state in (Config.STATE_SEARCHING, Config.STATE_TARGET_TEMPORARILY_LOST, Config.STATE_OWNER_LOST,
                                          Config.STATE_RECOVERING)
                 or not self.ekf.active) and not lidar_alive
         f_px = (w / 2.0) / math.tan(math.radians(Config.CAMERA_HFOV_DEG) / 2.0)
@@ -374,15 +384,77 @@ class CVPipeline:
         self.last_template_t = now
 
     def _stop_resume(self):
-        """Wait distance and resume distance, derived from the follow distance the operator set."""
-        d = max(Config.MIN_FOLLOW_DISTANCE, self.base_target_distance)
+        """Wait distance and resume distance, derived from the current (dynamic) follow distance."""
+        d = max(Config.MIN_FOLLOW_DISTANCE, self.base_target_distance, self.dynamic_target_distance)
         return max(0.4, d - 0.10), d + 0.15
+
+    def _update_dynamic_distance(self):
+        """Following distance = operator's set distance + a time headway on the owner's speed + a margin that grows
+        as tracking confidence falls (EKF position sigma, camera-only or LiDAR-only ranging, weak Re-ID)."""
+        base = max(Config.MIN_FOLLOW_DISTANCE, self.base_target_distance)
+        extra, conf = 0.0, 1.0
+        if self.ekf.active:
+            speed = math.hypot(self.ekf.s[2], self.ekf.s[3])
+            sigma = math.sqrt(max(self.ekf.P[0, 0], self.ekf.P[1, 1]))
+            mode_pen = {"LIDAR+CAM": 0.0, "CAM": 0.25, "LIDAR": 0.35}.get(self.fusion_mode, 0.5)
+            reid_pen = max(0.0, min(1.0, (0.55 - self.own_score) / 0.3)) if self.owner_enrolled else 0.0
+            unc = max(0.0, min(1.0, (sigma - 0.05) / 0.25))
+            conf = 1.0 - max(unc, mode_pen, reid_pen)
+            extra = Config.DIST_SPEED_GAIN * speed + Config.DIST_CONF_GAIN * (1.0 - conf)
+        target = base + max(0.0, min(Config.DIST_MAX_EXTRA, extra))
+        # grow quickly (safety), shrink slowly (no chasing the set point)
+        a = 0.3 if target > self.dynamic_target_distance else 0.05
+        self.dynamic_target_distance = max(base, (1 - a) * self.dynamic_target_distance + a * target)
+        self.tracking_confidence = round(conf, 2)
+        return self.dynamic_target_distance
 
     def _face_person(self, bearing):
         """Stationary but the person shifts sideways: turn to keep them centred."""
         if abs(bearing) < math.radians(3.0):
             return 0.0
-        return max(-0.8, min(0.8, 1.3 * bearing))
+        return max(-Config.FACE_TURN_MAX, min(Config.FACE_TURN_MAX, Config.FACE_TURN_GAIN * bearing))
+
+    def _predict_turn(self):
+        """Owner just lost: rotate (never drive) toward where the EKF says they are now, i.e. their last
+        LiDAR/camera position carried on along their velocity. Returns (v, w, status)."""
+        if not self.ekf.active:
+            return 0.0, 0.0, "HOLD_POSITION"
+        px, py = self.ekf.predicted(0.5)
+        b = math.atan2(py, px)
+        if abs(b) < math.radians(4.0):
+            return 0.0, 0.0, "HOLD_POSITION"
+        w = max(-Config.PREDICT_TURN_MAX, min(Config.PREDICT_TURN_MAX, Config.PREDICT_TURN_GAIN * b))
+        if self._lidar_fresh():
+            sec = lidar_lib.sectors(self.lidar_ranges)
+            if (w > 0 and sec["left"] < 0.22) or (w < 0 and sec["right"] < 0.22):
+                return 0.0, 0.0, "PREDICT_BLOCKED"
+        return 0.0, w, "PREDICT_TURN"
+
+    def _pursue_prediction(self, since):
+        """No map plan, but the owner was walking when lost: drive toward their extrapolated position (EKF coast,
+        velocity decaying) with LiDAR avoidance. None when there is no motion to follow, it is reached, or too old."""
+        if (not self.ekf.active or getattr(self, "_lost_speed", 0.0) < Config.PREDICT_MIN_SPEED
+                or since > Config.PREDICT_PURSUIT_SEC):
+            return None
+        r, b = self.ekf.range_bearing()
+        if r <= self.base_target_distance + 0.2:
+            return None
+        w = 0.0 if abs(b) < math.radians(3.0) else max(-1.5, min(1.5, 0.9 * Config.PID_TURN_KP * b))
+        v = Config.MEMORY_SPEED * max(0.0, math.cos(min(abs(b), math.pi / 2))) ** 2
+        if abs(b) > math.radians(60.0):
+            v = 0.0
+        elif 0.0 < v < Config.MIN_ROLLING_VEL:
+            v = Config.MIN_ROLLING_VEL
+        status = "PREDICT_PURSUIT"
+        if self._lidar_fresh():
+            sec = lidar_lib.sectors(self.lidar_ranges)
+            self.robot.set_front_clearance(sec["front_raw"], self.lidar_time)
+            v, w, avoid = self.lidar_avoid.apply(v, w, sec)
+            self._lidar_sectors = sec
+            if avoid in ("LIDAR_STOP", "LIDAR_AVOIDING"):
+                status = avoid
+        self.target_state = Config.STATE_RECOVERING
+        return v, w, status
 
     def _lidar_peek(self, now):
         """The camera cannot see the owner (legs only when close, behind something, off to the side) but a
@@ -416,10 +488,13 @@ class CVPipeline:
         if plan is None or not plan.get("memory"):
             if since < Config.SEARCH_START_DELAY_SEC + Config.MEMORY_PLAN_GRACE_SEC:
                 self.target_state = Config.STATE_TARGET_TEMPORARILY_LOST
-                return 0.0, 0.0, "MEMORY_PLANNING"
-            return None
+                v, w, st = self._predict_turn()          # face where they went while the planner catches up
+                return v, w, ("MEMORY_PLANNING" if st == "HOLD_POSITION" else st)
+            return self._pursue_prediction(since)       # no map: follow their motion; None -> search
+        if plan.get("status") == "OFF_MAP":
+            return self._pursue_prediction(since)
         if plan.get("status") not in ("DIRECT", "DETOUR"):
-            return None                      # AT_GOAL: nobody here after all. NO_PATH / OFF_MAP: cannot get there.
+            return None                      # AT_GOAL: nobody here after all. NO_PATH: cannot get there.
         blocked = plan.get("blocked") and plan.get("wp_bearing") is not None
         b = plan["wp_bearing"] if blocked else plan["mem_bearing"]
         goal_d = plan.get("goal_dist", 1.0)
@@ -443,6 +518,11 @@ class CVPipeline:
     def _recover_or_search(self, now):
         """Lost owner: first recall where they were and go there round any obstacle; the scan search is the last resort."""
         since = now - self.target_lost_time
+        if not self.memory_done and since < Config.SEARCH_START_DELAY_SEC:
+            self.target_state = Config.STATE_TARGET_TEMPORARILY_LOST
+            return self._predict_turn()
+        if not Config.RECOVERY_DRIVE_TO_LAST_SEEN:
+            return self._search_command(now)          # rotate toward where they went, sweep, full 360, stop
         if not self.memory_done and since >= Config.SEARCH_START_DELAY_SEC:
             result = self._pursue_memory(now, since)
             if result is not None:
@@ -476,13 +556,13 @@ class CVPipeline:
             return 0.0, 0.0, "HOLD_POSITION"
         t = elapsed - delay
         if t >= Config.SEARCH_MAX_DURATION_SEC:
-            self.target_state = Config.STATE_TARGET_TEMPORARILY_LOST
+            self._owner_lost()
             return 0.0, 0.0, "SEARCH_TIMEOUT_HALT"
         sweep_end = 1.2 + Config.SEARCH_SWEEP_SEC
         if t >= sweep_end:
             self.search_scan_rot += abs(self.robot.current_angular) * dt
             if self.search_scan_rot >= 2 * math.pi:
-                self.target_state = Config.STATE_TARGET_TEMPORARILY_LOST
+                self._owner_lost()
                 return 0.0, 0.0, "SEARCH_COMPLETE_360"
         self.target_state = Config.STATE_SEARCHING
         if t < sweep_end and self.ekf.active:
@@ -504,9 +584,47 @@ class CVPipeline:
                 return 0.0, 0.0, "SEARCH_BLOCKED"
         return 0.0, w, status
 
+    def _owner_lost(self):
+        if self.target_state != Config.STATE_OWNER_LOST:
+            self._log_event("OWNER_LOST", "Search finished without finding the owner. Stopped; waiting for them to reappear.")
+        self.target_state = Config.STATE_OWNER_LOST
+
+    def _paused_turn(self, bearing):
+        """Paused by the operator: stationary. Still face the owner, but only in hold-to-follow (where facing is the
+        normal idle behaviour); a classic pause means do not move at all."""
+        return (0.0, self._face_person(bearing)) if Config.FOLLOW_REQUIRES_RAISED_HAND else (0.0, 0.0)
+
     def _lidar_fresh(self):
         return (Config.LIDAR_FUSION and self.lidar_ranges is not None
                 and time.time() - self.lidar_time < Config.LIDAR_STALE_SEC)
+
+    def _update_hand(self, up, now):
+        """Debounce the hold-to-follow hand: RAISE_CONFIRM_FRAMES frames up to start, FOLLOW_RELEASE_SEC down to stop."""
+        if up:
+            self._raise_n += 1
+            if self._raise_n >= Config.RAISE_CONFIRM_FRAMES:
+                if not self.hand_raised:
+                    self._log_event("FOLLOW_HAND_UP", "Hand raised: following.")
+                self.hand_raised = True
+                self._last_raise_t = now
+        else:
+            self._raise_n = 0
+            if self.hand_raised and now - self._last_raise_t > Config.FOLLOW_RELEASE_SEC:
+                self.hand_raised = False
+                self._log_event("FOLLOW_HAND_DOWN", "Hand lowered: stopping here and keeping you centred.")
+
+    def _vote_mirror(self, raw_bearing, box_half, cam_range, found_here):
+        """Orientation self-check while the owner is tracked: is the LiDAR person at the camera's bearing, or at the
+        mirror image of it? Only off-centre sightings count (near the middle both sides coincide)."""
+        if abs(raw_bearing) < box_half + math.radians(4.0):
+            return
+        mirrored = lidar_lib.box_person_cluster(self.lidar_clusters, -raw_bearing, box_half, cam_range) is not None
+        if found_here == mirrored:
+            return                                        # both or neither: no evidence either way
+        votes = self.__dict__.setdefault("_mirror_votes", [])
+        votes.append(1 if mirrored else 0)
+        del votes[:-40]
+        self.mirror_suspect = len(votes) >= 25 and sum(votes) >= 0.8 * len(votes)
 
     def _fuse(self, cand, w, now, t_meas=None):
         """Camera pinhole bearing + range, cross-checked with the LiDAR, filtered by the EKF.
@@ -521,17 +639,15 @@ class CVPipeline:
 
         lidar_r = lidar_b = None
         if self._lidar_fresh():
-            near = self.ekf.range_bearing()[0] if self.ekf.active else vis_d
-            # only LiDAR clusters whose bearing lies inside the person's box (co-mapping), not a fixed window
+            # co-mapping: the person is the nearest person-sized cluster inside their own box, at a range the
+            # camera roughly agrees with (raw camera range, not the LiDAR-scaled one, so a wrong lock cannot feed itself)
             x1, _, x2, _ = cand["bbox"]
-            box_half_deg = math.degrees(math.atan(0.5 * (x2 - x1) / f_px))
-            pc = lidar_lib.person_cluster(self.lidar_clusters, bearing_cam, near,
-                                          window_deg=max(4.0, min(20.0, box_half_deg + 2.0)))
+            box_half = math.atan(0.5 * (x2 - x1) / f_px)
+            pc = lidar_lib.box_person_cluster(self.lidar_clusters, bearing_cam, box_half, cand["distance_m"])
             self._owner_beams = pc["idx"] if pc is not None else None
+            self._vote_mirror(raw_bearing, box_half, cand["distance_m"], pc is not None)
             if pc is not None:
                 lidar_r, lidar_b = pc["range"], pc["bearing"]
-                if abs(lidar_r - vis_d) > Config.LIDAR_AGREE_FRAC * max(vis_d, lidar_r) and not self.ekf.active:
-                    lidar_r = None
         self.fusion_mode = "LIDAR+CAM" if lidar_r is not None else "CAM"
 
         if not self.ekf.active or self.ekf.rejects >= 6:
@@ -542,9 +658,11 @@ class CVPipeline:
             self.ekf.update(vis_d, bearing_cam, 0.12 * vis_d, math.radians(1.5))
             if lidar_r is not None:
                 if self.ekf.update(lidar_r, lidar_b, 0.05, math.radians(1.0)):
-                    # the LiDAR is the better ruler: slowly correct the camera's size-based distance
+                    # the LiDAR is the better ruler: slowly correct the camera's size-based distance, but only from
+                    # a close agreement and within bounds, so one bad association cannot walk the scale away
                     ratio = lidar_r / max(cand["distance_m"], 0.1)
-                    self.vision_scale = max(0.6, min(1.6, 0.98 * self.vision_scale + 0.02 * ratio))
+                    if 0.7 <= ratio <= 1.4:
+                        self.vision_scale = max(0.75, min(1.35, 0.98 * self.vision_scale + 0.02 * ratio))
                     err = (lidar_b - raw_bearing + math.pi) % (2 * math.pi) - math.pi
                     self.cam_bearing_bias = max(-0.1, min(0.1, 0.97 * self.cam_bearing_bias + 0.03 * err))
         self.ekf.predict(now, v_r, w_r)   # the frame is ~100 ms old by now; bring the estimate up to date
@@ -564,9 +682,12 @@ class CVPipeline:
             b_ctl = plan["wp_bearing"]          # steer at the waypoint round the obstacle, not through it
         ux, uy = self.ekf.s[2], self.ekf.s[3]
         los = (self.ekf.s[0] * ux + self.ekf.s[1] * uy) / max(rng, 0.1)
+        px, py = self.ekf.s[0], self.ekf.s[1]
+        ang_rate = (px * uy - py * ux) / max(px * px + py * py, 0.09)   # the person's own motion across the view
         v, w_cmd = self.follow.command(rng, b_ctl, self.ekf.range_rate(),
                                        self.ekf.bearing_rate(self.robot.current_angular), los, dt,
-                                       desired=self.base_target_distance)
+                                       desired=self.dynamic_target_distance,
+                                       person_ang_rate=0.0 if detour else ang_rate)
         if self._lidar_fresh():
             sec = lidar_lib.sectors(self.lidar_ranges, exclude=(bearing, half, rng))
             self.robot.set_front_clearance(sec["front_raw"], self.lidar_time)
@@ -652,7 +773,7 @@ class CVPipeline:
                         best_cand = cand
 
                 if best_cand is not None and self._accept_owner(best_cand, best_score, len(candidates), now, w, lidar_alive=lidar_pc is not None):
-                    if self.target_state in [Config.STATE_SEARCHING, Config.STATE_TARGET_TEMPORARILY_LOST,
+                    if self.target_state in [Config.STATE_SEARCHING, Config.STATE_TARGET_TEMPORARILY_LOST, Config.STATE_OWNER_LOST,
                                              Config.STATE_RECOVERING]:
                         self._log_event("TARGET_REACQUIRED", f"Owner re-acquired! Re-ID confidence: {best_score:.2f}")
                     self.target_lost_time = None
@@ -685,13 +806,17 @@ class CVPipeline:
                     matched_target = None
                     self.owner_match_score = 0.0
 
-                    if lidar_pc is None and self.target_state in [Config.STATE_FOLLOWING, Config.STATE_WAIT_FOR_OWNER_MOVEMENT]:
+                    if lidar_pc is None and self.target_state in [Config.STATE_FOLLOWING, Config.STATE_WAIT_FOR_OWNER_MOVEMENT,
+                                                                  Config.STATE_AWAITING_GESTURE, Config.STATE_LIDAR_GUIDED]:
                         self.target_state = Config.STATE_TARGET_TEMPORARILY_LOST
                         self.target_lost_time = now
                         self._log_event("TARGET_LOST", "Owner occluded or out of view. Robot stopped; holding position.")
         else:
             # No owner enrolled
-            if self.target_state not in [Config.STATE_OWNER_RELEASED, Config.STATE_MANUAL_CONTROL, Config.STATE_SAFETY_STOP]:
+            if self.target_state == Config.STATE_OWNER_RELEASED:
+                if now - getattr(self, "_released_t", 0.0) > Config.RELEASED_SHOW_SEC:
+                    self.target_state = Config.STATE_IDLE
+            elif not (self.safety_latched and self.target_state == Config.STATE_SAFETY_STOP):
                 self.target_state = Config.STATE_IDLE
             if len(candidates) > 0:
                 # Potential candidate ready for enrollment
@@ -728,7 +853,7 @@ class CVPipeline:
                         matched_target = subject
                 else:
                     self.start_following()
-            elif active_gesture == "WAIT":
+            elif active_gesture == "WAIT" and not Config.FOLLOW_REQUIRES_RAISED_HAND:
                 self.pause_following()
             elif active_gesture == "RELEASE":
                 self.release_owner()
@@ -736,6 +861,9 @@ class CVPipeline:
             elif active_gesture == "STOP_HALT":
                 self.trigger_safety_stop("Robot halted by STOP gesture. Raise one hand (FOLLOW ME) or press START to resume.")
         manual_stop_signal = self.safety_latched or active_gesture == "STOP_HALT"
+        if self.owner_enrolled and subj_i is not None:
+            up = labels[subj_i] != "STOP_HALT" and self.gestures.hand_raised(candidates[subj_i].get("landmarks"))
+            self._update_hand(up, now)
 
         # Step 4: Lost-Human Trajectory Projection (Conservative stop, no blind rotation)
         projected_bbox = None
@@ -800,15 +928,16 @@ class CVPipeline:
                 half = math.atan2(lidar_pc["width"] / 2.0, max(fused_r, 0.3)) + 0.06
                 self.fusion_mode = "LIDAR"
                 if not self.lidar_only:
-                    self._log_event("LIDAR_TRACKING", "Owner out of camera view (too close or off to the side). Following by LiDAR.")
+                    self._raised_at_loss = self.hand_raised
+                    self._log_event("LIDAR_TRACKING", "Owner out of camera view. LiDAR has them: turning to bring them back into view.")
                 if self.target_state == Config.STATE_RECOVERING:
                     # found again by the LiDAR while driving to the remembered spot: give the approach a fresh leash so the
                     # camera has time to see them again, and say so
-                    self.last_cam_seen = now - Config.LIDAR_TRACK_MAX_SEC + 6.0
+                    self.last_cam_seen = now               # a fresh LiDAR leash; the camera must confirm within it
                     self._log_event("MEMORY_RELOCK", "LiDAR found the owner near the remembered position. Following again.")
                 self.lidar_only = True
                 if self.target_state in (Config.STATE_SEARCHING, Config.STATE_TARGET_TEMPORARILY_LOST,
-                                         Config.STATE_RECOVERING, Config.STATE_IDLE):
+                                         Config.STATE_RECOVERING, Config.STATE_IDLE, Config.STATE_OWNER_LOST):
                     self.target_state = Config.STATE_WAIT_FOR_OWNER_MOVEMENT
             offset_x_norm = math.tan(-fused_b) / tan_half   # positive = person on the right of the image
 
@@ -827,6 +956,7 @@ class CVPipeline:
             dist = telemetry["distance_m"]
             offset_x = telemetry["offset_x_norm"]
 
+            self._update_dynamic_distance()
             stop_d, resume_d = self._stop_resume()
             # Evaluate State Machine Transitions
             if not self.owner_enrolled:
@@ -834,8 +964,23 @@ class CVPipeline:
                 v_x, w_z = 0.0, 0.0
             elif not self.following_enabled:
                 # Paused / locked state (or latched by STOP_HALT)
-                self.target_state = Config.STATE_SAFETY_STOP if self.safety_latched else Config.STATE_WAIT_FOR_OWNER_MOVEMENT
-                v_x, w_z = 0.0, 0.0
+                self.target_state = Config.STATE_SAFETY_STOP if self.safety_latched else Config.STATE_PAUSED
+                v_x, w_z = self._paused_turn(fused_b)
+            elif Config.FOLLOW_REQUIRES_RAISED_HAND and self.lidar_only:
+                # Lost from the camera, LiDAR still has them: LiDAR-guided search. Turn to bring them back into the
+                # picture; keep up with them only if they were being followed (hand up) when the camera lost them.
+                self.target_state = Config.STATE_LIDAR_GUIDED
+                v_x, w_z = 0.0, self._face_person(fused_b)     # rotate to find them; never drive blind
+                telemetry["nav_status"] = "LIDAR_GUIDED_TURN"
+            elif Config.FOLLOW_REQUIRES_RAISED_HAND and not self.hand_raised:
+                # Owner in view, hand down: stay put, keep them centred in the camera, never search.
+                if self.target_state != Config.STATE_AWAITING_GESTURE:
+                    self._log_event("AWAITING_GESTURE", "Owner in view. Raise a hand above your shoulder to make me follow.")
+                self.target_state = Config.STATE_AWAITING_GESTURE
+                self.follow.reset()
+                self.last_ctl_t = None
+                v_x, w_z = 0.0, self._face_person(fused_b)
+                telemetry["nav_status"] = "AWAITING_GESTURE"
             else:
                 # Following is enabled for enrolled owner
                 # Required transition: FOLLOWING -> WAIT_FOR_OWNER_MOVEMENT
@@ -891,9 +1036,15 @@ class CVPipeline:
                     self.ekf.reset()
                 else:
                     self.last_exit_direction = 1 if self.ekf.s[1] < 0 else -1  # predicted to be on the right
-            if self.owner_enrolled and self.following_enabled:
+            if self.owner_enrolled and self.following_enabled and self.last_cam_seen is None:
+                # restored profile, owner not seen yet this session: wait for them, do not search for them
+                if self.target_state not in (Config.STATE_SAFETY_STOP, Config.STATE_PAUSED):
+                    self.target_state = Config.STATE_OWNER_LOCKED
+                telemetry["nav_status"] = "WAITING_FOR_OWNER"
+            elif self.owner_enrolled and self.following_enabled:
                 if self.target_lost_time is None:
                     self.target_lost_time = now
+                    self._lost_speed = math.hypot(self.ekf.s[2], self.ekf.s[3]) if self.ekf.active else 0.0
                     self._search_t = None
                     self.search_scan_rot = 0.0
                     self.memory_done = False
@@ -911,9 +1062,34 @@ class CVPipeline:
         if self.safety_latched:
             self.target_state = Config.STATE_SAFETY_STOP
             v_x, w_z = 0.0, 0.0
+        # Sensor abnormality: the LiDAR was streaming and has gone silent. Avoidance and the hard stop depend on it.
+        lidar_fault = (Config.LIDAR_FUSION and self.lidar_ranges is not None
+                       and now - self.lidar_time > Config.LIDAR_FAULT_SEC)
+        if lidar_fault:
+            if not getattr(self, "_lidar_fault", False):
+                self._log_event("SENSOR_FAULT", "LiDAR stopped sending scans. Robot stopped until it returns.")
+            v_x, w_z = 0.0, 0.0
+            telemetry["nav_status"] = "SENSOR_FAULT_LIDAR"
+        elif getattr(self, "_lidar_fault", False):
+            self._log_event("SENSOR_OK", "LiDAR scans are back.")
+        self._lidar_fault = lidar_fault
+        telemetry["sensor_fault"] = "LIDAR_STALE" if lidar_fault else None
+        if self.safety_latched or lidar_fault or self.robot.emergency_stop:
+            telemetry["phase2_cmd_vel"] = {"linear_x": 0.0, "angular_z": 0.0}   # report what is actually sent
         # the state after this frame's transitions, not the one it started in
         telemetry["target_state"] = self.target_state
+        telemetry["follow_state"] = self.target_state           # the behaviour state underneath any override
+        # Overrides that stop or bypass autonomy are shown as the state, so the diagram never claims FOLLOWING while
+        # the wheels are held. Priority: E-STOP / latch > sensor fault > manual teleop.
+        if self.robot.emergency_stop or self.safety_latched:
+            telemetry["target_state"] = Config.STATE_SAFETY_STOP
+        elif lidar_fault:
+            telemetry["target_state"] = Config.STATE_SENSOR_FAULT
+        elif self.robot.mode == "MANUAL":
+            telemetry["target_state"] = Config.STATE_MANUAL_CONTROL
         telemetry["safety_latched"] = self.safety_latched
+        telemetry["hand_raised"] = self.hand_raised
+        telemetry["hold_to_follow"] = bool(Config.FOLLOW_REQUIRES_RAISED_HAND)
         telemetry["ambiguous"] = self.ambiguous
 
         # Step 6: Safety Layer Evaluation
@@ -923,13 +1099,17 @@ class CVPipeline:
             telemetry["target_state"],
             manual_stop_gesture=manual_stop_signal
         )
+        if lidar_fault:
+            safety_eval["status"], safety_eval["can_move"] = "SENSOR_FAULT", False
+            safety_eval["alerts"] = list(safety_eval["alerts"]) + ["Sensor: LiDAR data stale (> %.1f s)" % Config.LIDAR_FAULT_SEC]
         telemetry["safety_status"] = safety_eval["status"]
         telemetry["safety_alerts"] = safety_eval["alerts"]
 
         # Forward verified velocity commands to physical robot motors
         if tracking:
             self.robot.update_auto_commands(v_x, w_z, can_move=safety_eval["can_move"])
-        elif self.target_state in (Config.STATE_SEARCHING, Config.STATE_RECOVERING) and (w_z != 0.0 or v_x != 0.0):
+        elif self.target_state in (Config.STATE_SEARCHING, Config.STATE_RECOVERING,
+                                   Config.STATE_TARGET_TEMPORARILY_LOST) and (w_z != 0.0 or v_x != 0.0):
             self.robot.update_auto_commands(v_x, w_z, can_move=safety_eval["can_move"])
         else:
             self.robot.update_auto_commands(0.0, 0.0, can_move=False)
@@ -958,8 +1138,7 @@ class CVPipeline:
             x1, y1, x2, y2 = cand["bbox"]
             lidar_m = None
             if proj is not None:
-                lidar_m, _n = fusion.box_range(proj, cam.box_beams(proj, cand["bbox"]),
-                                               near=cand["distance_m"] * self.vision_scale)
+                lidar_m, _n = fusion.box_range(proj, cam.box_beams(proj, cand["bbox"]), near=cand["distance_m"])
             overlay.append({
                 "bbox": [
                     round(x1 / float(w), 4),
@@ -975,8 +1154,11 @@ class CVPipeline:
                 "match": cand.get("similarity_to_owner"),
             })
         telemetry["overlay"] = overlay
-        telemetry["camera"] = {"hfov_deg": Config.CAMERA_HFOV_DEG, "yaw_deg": round(Config.CAM_YAW_DEG + math.degrees(self.cam_bearing_bias), 2)}
-        telemetry["control"] = {"desired": self.base_target_distance, "stop": round(self._stop_resume()[0], 2),
+        telemetry["mirror_suspect"] = bool(getattr(self, "mirror_suspect", False))
+        telemetry["camera"] = {"mirror": bool(Config.CAM_MIRROR), "hfov_deg": Config.CAMERA_HFOV_DEG, "yaw_deg": round(Config.CAM_YAW_DEG + math.degrees(self.cam_bearing_bias), 2)}
+        telemetry["dynamic_target_distance"] = round(self.dynamic_target_distance, 2)
+        telemetry["tracking_confidence"] = getattr(self, "tracking_confidence", None)
+        telemetry["control"] = {"set": self.base_target_distance, "desired": round(self.dynamic_target_distance, 2), "stop": round(self._stop_resume()[0], 2),
                                 "resume": round(self._stop_resume()[1], 2), "cmd_v": round(v_x, 3), "cmd_w": round(w_z, 3)}
 
         # Step 7: Render Tactical HUD with Obstacle Corridors

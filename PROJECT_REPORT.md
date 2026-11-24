@@ -185,7 +185,25 @@ $$v = \Big[K_{pd}e_d + K_{id}\!\int e_d + K_{dd}\dot r_{EKF} + K_{ff}\,\max(0,u_
 
 $K_{ff}=0.8$, and $\phi(r)$ fades the feed-forward to zero within 0.15 m inside the set distance, so a person who stops cannot drag the robot in. The derivative terms use the EKF's range and bearing rates instead of differencing noisy measurements. The integrators are clamped and only integrate while the output is not saturated (anti-windup). The $\cos^2$ factor makes the robot turn before driving when the owner is far off-axis. Outputs are limited to $v\in[0,0.22]$ m/s and $|\omega|\le2.0$ rad/s. Commands between 0.06 and 0.08 m/s are raised to 0.08 m/s to overcome static friction, and smaller ones are set to zero. The `RobotController` then slew-limits the commands to 1.6 m/s² and 8 rad/s².
 
-### 4.6 Distance hysteresis (follow and wait)
+### 4.6 Dynamic following distance and hysteresis
+
+The set-point adapts to the owner's motion and to tracking confidence, as the abstract specifies:
+
+$$d^\* = d_{set} + \min\Big(\Delta_{max},\ \tau\,\lVert\mathbf u\rVert + k_c\,(1 - c)\Big),\qquad c = 1 - \max\big(u_\sigma,\ p_{mode},\ p_{reid}\big)$$
+
+The terms:
+- **Time headway:** $\tau$ = 0.5 s on the EKF speed $\lVert\mathbf u\rVert$.
+- **Confidence margin:** $k_c$ = 0.35 m, applied in proportion to $1 - c$.
+- **Cap:** $\Delta_{max}$ = 0.6 m.
+- **Confidence inputs:**
+  - $u_\sigma = \operatorname{clip}((\sigma_{pos} - 0.05)/0.25)$ from the EKF position covariance;
+  - $p_{mode}$ = 0 for LiDAR+camera, 0.25 for camera-only, 0.35 for LiDAR-only;
+  - $p_{reid}$ grows as the owner's running Re-ID score falls below 0.55.
+- **Smoothing:** the set-point grows quickly ($\alpha$ = 0.3) and shrinks slowly ($\alpha$ = 0.05).
+
+The stop and resume distances below are derived from $d^\*$.
+
+#### Hysteresis (follow and wait)
 
 With set distance $d^\*$ = 1.20 m (adjustable from the dashboard, minimum 0.60 m):
 
@@ -263,45 +281,71 @@ Uses:
 
 ## 5. State Machine
 
+The machine below is the one implemented in `laptop/cv_pipeline.py` with hold-to-follow enabled (the default).
+`tests/test_state_machine.py` drives every transition through the real per-frame pipeline. It also checks two things:
+- each of the 16 states is reached by at least one scenario;
+- the dashboard diagram (`static/js/viz.js`) draws exactly these states, so the diagram, this table and the code cannot drift apart.
+
 ### 5.1 States
+
+**Behaviour states** (the follow logic):
 
 | State | Meaning | Motion |
 |---|---|---|
 | `IDLE` | No owner enrolled | Stopped |
-| `OWNER_LOCKED` | Owner just enrolled; profile and protected template created | Stopped (transient, one frame) |
-| `FOLLOWING` | Owner tracked, $r > d_{stop}$ | PID + avoidance |
-| `WAIT_FOR_OWNER_MOVEMENT` | Owner within $d_{stop}$, or following paused by `WAIT` | Rotate in place to face owner only |
-| `TARGET_TEMPORARILY_LOST` | Owner not in camera or LiDAR; 0.4 s hold, or waiting for the first plan | Stopped |
-| `RECALLING_LAST_POSITION` | Driving to the remembered position via A* | ≤ 0.15 m/s + avoidance |
-| `SEARCH_ROTATING` | 3-phase rotational search | Rotation only, ≤ 1.0 rad/s |
-| `TARGET_AMBIGUOUS` | Two candidates indistinguishable ($\Delta S < 0.08$, including position continuity) | Stopped; no loss timer, so never recall or search |
-| `SAFETY_STOP` | `STOP_HALT` seen (latched) | Stopped until the owner's `FOLLOW_ME` or START |
-| `OWNER_RELEASED` | `RELEASE` gesture or button; profile deleted | Stopped |
-| `MANUAL_CONTROL` | Dashboard teleoperation (controller mode `MANUAL`); autonomous commands ignored | Operator |
+| `OWNER_LOCKED` | Profile ready (just enrolled, or restored from disk); owner not seen yet this session | Stopped; never searches for someone not yet seen |
+| `AWAITING_FOLLOW_GESTURE` | Owner in view, hand below the shoulder | Rotate only, keeping the owner centred |
+| `FOLLOWING` | Owner in view, hand above the shoulder | PID + LiDAR avoidance; distance adapts (§4.6) |
+| `WAIT_FOR_OWNER_MOVEMENT` | Hand up, owner inside the stop distance | Rotate only (face the owner) |
+| `PAUSED` | Operator pressed PAUSE | Rotate only (face the owner); a raised hand does not override it |
+| `LIDAR_GUIDED_SEARCH` | Owner out of the camera, LiDAR still has them (≤ 4 s) | Rotate toward the LiDAR position, never drive |
+| `TARGET_TEMPORARILY_LOST` | Camera and LiDAR both lost the owner (first 0.4 s) | Turn toward the predicted direction |
+| `SEARCH_ROTATING` | Rotate to find | Predicted turn, then a ±110° sweep, then a full 360° |
+| `RECALLING_LAST_POSITION` | Optional (`RECOVERY_DRIVE_TO_LAST_SEEN`) | A* to the remembered spot, LiDAR avoidance |
+| `OWNER_LOST` | Search exhausted (360° done or 30 s) | Stopped; re-acquires on sight |
+| `OWNER_RELEASED` | RELEASE gesture or button; profile deleted | Stopped; becomes `IDLE` after 2 s |
 
-`OWNER_ENROLLMENT` is declared in `Config` but no code path assigns it: enrollment happens within a single frame and goes straight to `OWNER_LOCKED`.
+**Overrides** (drawn dashed; shown instead of the behaviour state, which keeps running underneath and is reported as `follow_state`):
+
+| State | Trigger | Motion |
+|---|---|---|
+| `SAFETY_STOP` | STOP gesture (latched) or dashboard E-STOP | Stopped |
+| `SENSOR_FAULT` | LiDAR silent > 1.5 s, or no camera frames > 0.8 s | Stopped |
+| `MANUAL_CONTROL` | Teleop mode | Operator only |
+| `TARGET_AMBIGUOUS` | Two candidates match the owner within 0.08 | Stopped; no loss timer, so no search |
 
 ### 5.2 Transition table
 
 | From | Event / guard | To |
 |---|---|---|
-| `IDLE` | `FOLLOW_ME` gesture by a valid pose, or dashboard *Enroll* | `OWNER_LOCKED` |
-| `OWNER_LOCKED` | next frame, following enabled | `FOLLOWING` / `WAIT_FOR_OWNER_MOVEMENT` (by distance) |
-| `FOLLOWING` | $r \le d_{stop}$ | `WAIT_FOR_OWNER_MOVEMENT` |
-| `WAIT_FOR_OWNER_MOVEMENT` | $r \ge d_{resume}$ for 3 frames, following enabled | `FOLLOWING` |
-| any following state | `WAIT` gesture | `WAIT_FOR_OWNER_MOVEMENT` (following disabled) |
-| `WAIT_FOR_OWNER_MOVEMENT` (paused) | `FOLLOW_ME` gesture | `FOLLOWING` |
-| `FOLLOWING` / `WAIT…` | owner absent from camera; LiDAR cluster still at EKF prediction | same state, *LiDAR-only tracking* (≤ 12 s) |
-| `FOLLOWING` / `WAIT…` | owner absent from camera **and** LiDAR | `TARGET_TEMPORARILY_LOST` |
-| `TARGET_TEMPORARILY_LOST` | after 0.4 s, memory plan is `DIRECT`/`DETOUR` | `RECALLING_LAST_POSITION` |
-| `RECALLING_LAST_POSITION` | LiDAR cluster near prediction (`MEMORY_RELOCK`) or camera Re-ID passes | `FOLLOWING` / `WAIT…` |
-| `RECALLING_LAST_POSITION` | reached the spot, no path, off the map, or 25 s elapsed | `SEARCH_ROTATING` |
-| `SEARCH_ROTATING` | Re-ID gate passes (§4.3) | `FOLLOWING` / `WAIT…` |
-| `SEARCH_ROTATING` | 360° covered or 30 s | `TARGET_TEMPORARILY_LOST` (halted) |
-| any tracked state | top two candidates ≥ 0.40 and within 0.08 | `TARGET_AMBIGUOUS` |
-| any | `STOP_HALT` from **anyone** in view | `SAFETY_STOP`, **latched** |
-| `SAFETY_STOP` | owner's `FOLLOW_ME`, or dashboard START | `FOLLOWING` |
-| any with owner | `RELEASE` (crossed arms) or dashboard *Release* | `OWNER_RELEASED` → `IDLE` |
+| `IDLE` | `FOLLOW_ME` (wrist above the head) or ENROLL | `OWNER_LOCKED` |
+| `OWNER_LOCKED` | owner matched in the camera | `AWAITING_FOLLOW_GESTURE` |
+| `AWAITING_FOLLOW_GESTURE` | owner's hand above the shoulder for 3 frames | `FOLLOWING` |
+| `FOLLOWING` | hand down for 0.6 s | `AWAITING_FOLLOW_GESTURE` |
+| `FOLLOWING` | $d \le d_{stop}$ | `WAIT_FOR_OWNER_MOVEMENT` |
+| `WAIT_FOR_OWNER_MOVEMENT` | $d \ge d_{resume}$ for 3 frames | `FOLLOWING` |
+| `AWAITING` / `FOLLOWING` | PAUSE | `PAUSED` |
+| `PAUSED` | START or the owner's FOLLOW ME | `AWAITING_FOLLOW_GESTURE` / `FOLLOWING` |
+| `FOLLOWING` / `AWAITING` | owner leaves the camera, LiDAR cluster still at the EKF prediction | `LIDAR_GUIDED_SEARCH` |
+| `LIDAR_GUIDED_SEARCH` | camera sees the owner again | `AWAITING` / `FOLLOWING` (by the hand) |
+| `LIDAR_GUIDED_SEARCH` | LiDAR loses them, or 4 s without camera confirmation | `TARGET_TEMPORARILY_LOST` |
+| `TARGET_TEMPORARILY_LOST` | 0.4 s | `SEARCH_ROTATING` (or `RECALLING_LAST_POSITION` if enabled) |
+| `RECALLING_LAST_POSITION` | arrived with nobody there, no path, or 25 s | `SEARCH_ROTATING` |
+| `SEARCH_ROTATING` | 360° covered or 30 s | `OWNER_LOST` |
+| `SEARCH_ROTATING` / `OWNER_LOST` | owner re-identified (Re-ID gate, §4.3) | `AWAITING_FOLLOW_GESTURE` (search stops, owner centred) |
+| any | RELEASE gesture (owner) or button | `OWNER_RELEASED` → `IDLE` after 2 s |
+| any | STOP gesture from anyone / E-STOP | `SAFETY_STOP` (override); cleared by the owner's FOLLOW ME / START, or AUTO FOLLOW for E-STOP |
+| any | LiDAR or video loss | `SENSOR_FAULT` (override) until the sensor returns |
+| any | teleop | `MANUAL_CONTROL` (override) until AUTO FOLLOW / START |
+| any tracked state | top two candidates ≥ 0.40 and within 0.08 | `TARGET_AMBIGUOUS` until only one matches |
+
+**Defects found and fixed while verifying this machine:**
+- **`OWNER_RELEASED`** never returned to `IDLE`.
+- **`SAFETY_STOP`** stuck after a latch was cleared before enrollment.
+- **PAUSE** was displayed as `WAIT_FOR_OWNER_MOVEMENT`.
+- **Restored profile:** under hold-to-follow it could not be started by a raised hand. Had it been armed, it would have started a search for an owner not yet seen this session.
+- **Exhausted search** fell back to `TARGET_TEMPORARILY_LOST`.
+- **Overrides not shown:** E-STOP, MANUAL and sensor faults left the displayed state unchanged while the wheels were held.
 
 ### 5.3 Gestures (MediaPipe landmarks, normalised image coordinates, y grows downwards)
 
@@ -333,6 +377,7 @@ The layers are independent: each one can stop the robot even if every layer abov
 | 9 | **Pi command watchdog** | Raspberry Pi | No UDP command for **0.35 s** (≈ 10 packets at 30 Hz) | `/cmd_vel` = 0 published to OpenCR |
 | 10 | Stale or fake video | Laptop | No camera frame for 0.8 s; the laptop's offline test pattern; the Pi's "no camera" placeholder; frames before the first Pi status | Frames never reach perception; `VIDEO_LOST`, robot stopped |
 | 11 | Search limits | Laptop | Recall ≤ 25 s, search ≤ 30 s / 360° | Halt and wait for the owner |
+| 11b | Sensor abnormality | Laptop | LiDAR was streaming and has been silent > 1.5 s | `SENSOR_FAULT`, motion blocked until scans return |
 | 12 | Test isolation | Tests | `tests/__init__.py` and `conftest.py` force `COMMAND_MODE="mock"`, `PI_IP=127.0.0.1` | The test suite can never drive the real robot |
 
 ---

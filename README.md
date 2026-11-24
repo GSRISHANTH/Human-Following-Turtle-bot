@@ -419,3 +419,37 @@ It takes about 11 ms per scan. People and moving objects are kept out of the map
 
 ### HIL bench now includes LiDAR
 `run_hil.bat` simulates an LDS-02 scan of a 6 × 4 m furnished room (`hil/world.py`) at 10 Hz with the plant's odometry, so the map, SLAM and co-mapping all run without the robot.
+
+## 9. Hold-to-Follow, Orientation Check and the RViz View
+
+### Hold-to-follow (default; `FOLLOW_REQUIRES_RAISED_HAND`)
+| You do | Robot does |
+|---|---|
+| Hold one hand **above your shoulder** | Follows. It starts after 3 frames with the hand up. |
+| Lower your hand | Stops after 0.6 s, then stays put and keeps turning to keep you centred (`AWAITING_FOLLOW_GESTURE`). It never searches. |
+| Walk out of the camera's view while the LiDAR still sees you | `LIDAR_GUIDED_SEARCH`: **rotates** toward your LiDAR position to bring you back into view. It never drives blind, and the LiDAR-only track expires after 4 s without camera confirmation. |
+| Disappear from both camera and LiDAR | **Rotate to find:** turns at once toward where you went, sweeps wider (±110°), does a full 360°, then stops. Driving to the last-seen spot is optional (`RECOVERY_DRIVE_TO_LAST_SEEN`, off by default). |
+| Reappear during the search | The search stops, it centres you and waits for your hand. |
+| Both hands up | STOP (latched), from anyone. |
+
+**Following distance adapts:**
+- **Formula:** set distance + 0.5 s × your walking speed + up to 0.35 m when tracking confidence is low (camera-only or LiDAR-only ranging, high EKF uncertainty, weak Re-ID).
+- **Cap:** at most +0.6 m.
+- **On the dashboard:** shown as *Dynamic* on the distance card and as *target* on the range chart.
+
+**Sensor fault:** if the LiDAR stops sending scans for 1.5 s, the robot stops with a SENSOR FAULT banner until scans return.
+
+Only the enrolled owner's hand counts. Untick *Hold-to-follow* in LIVE SETTINGS to go back to gesture-latched following.
+
+### Left/right orientation check (10 s)
+Stand about 1.5 m to the robot's **right**:
+1. **Live view:** you must appear on the **right** of the picture. If you don't, tick *Camera mirrored*.
+2. **Map:** you must appear to the **right** of `base_link` (green Y axis points left). If you don't, tick *LiDAR mirrored*. If you appear rotated instead, set *LiDAR yaw offset*.
+
+While you are tracked, the dashboard also checks this by itself. If the LiDAR keeps finding you on the mirror side of the camera, a **LEFT/RIGHT MISMATCH** banner appears.
+
+### RViz-style map view
+The map card is a top-down, RViz-like view in the fixed frame `map` (x right, y up):
+- **Displays:** occupancy grid (free light grey, occupied black), 1 m grid, LaserScan coloured by object type, odometry trail, planned path with goal pose, last-seen marker, owner with velocity arrow and 2σ covariance ellipse, `base_link` TF axes, Burger footprint and camera field of view.
+- **Controls:** drag to pan, wheel to zoom, double-click to reset; FOLLOW and ROBOT UP toggles; a checkbox per display.
+- **Data:** `/api/scene` (10 Hz SSE) and `/api/map.png` (the occupancy grid, with its origin in the response headers).

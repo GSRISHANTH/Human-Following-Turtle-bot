@@ -45,8 +45,10 @@ class FollowController:
         self.dist.reset()
         self.turn.reset()
 
-    def command(self, rng, bearing, range_rate, bearing_rate, person_los_speed, dt, desired=None):
-        """Returns (v, w). bearing in rad, rates in per-second units."""
+    def command(self, rng, bearing, range_rate, bearing_rate, person_los_speed, dt, desired=None, person_ang_rate=0.0):
+        """Returns (v, w). bearing in rad, rates in per-second units.
+        person_ang_rate: the person's own angular velocity about the robot (rad/s), from the EKF velocity. Fed
+        forward so the robot turns *with* someone walking across its view instead of after they have drifted."""
         desired = Config.DESIRED_DISTANCE if desired is None else desired
         dt = max(1e-3, min(0.3, dt))
         # gains are read live so the dashboard can tune them while following
@@ -58,6 +60,8 @@ class FollowController:
         if abs(bearing) < math.radians(Config.STEERING_DEADZONE_DEG):
             w = 0.0
             self.turn.integral *= 0.9
+        w += Config.PID_TURN_FF * person_ang_rate
+        w = max(-Config.MAX_ANGULAR_VEL, min(Config.MAX_ANGULAR_VEL, w))
 
         e_d = rng - desired
         v = self.dist.step(e_d, range_rate, dt, 0.0, Config.MAX_LINEAR_VEL)

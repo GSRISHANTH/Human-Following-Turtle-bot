@@ -75,6 +75,7 @@ document.addEventListener("DOMContentLoaded", () => {
     // --- Telemetry: pushed by the server as each pose result lands ---
     let latestOverlay = [];
     let latestLidarCam = [];
+    let camMirror = false;
     let overlayAt = 0;
     let lastPoseStamp = 0;
 
@@ -87,6 +88,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 lastPoseStamp = data.last_update;
                 latestOverlay = data.overlay || [];
                 latestLidarCam = data.lidar_cam || [];
+                camMirror = !!(data.camera && data.camera.mirror);
                 overlayAt = performance.now();
                 recordSample(data);
             }
@@ -372,7 +374,9 @@ document.addEventListener("DOMContentLoaded", () => {
             el.textContent = v == null ? "--" : `${v.toFixed(2)} m`;
             el.className = v == null ? "" : v < 0.35 ? "bad" : v < 0.85 ? "warn" : "";
         });
-        setText("fu-mode", f.mode || "--", f.mode === "LIDAR+CAM" ? "ok" : f.mode === "CAM" ? "warn" : "");
+        const conf = d.tracking_confidence;
+        setText("fu-mode", (f.mode || "--") + (conf != null && f.mode !== "LOST" ? `  conf ${Math.round(conf * 100)}%` : ""),
+                f.mode === "LIDAR+CAM" ? "ok" : f.mode === "CAM" ? "warn" : "");
         const nav = d.nav_status || "--";
         setText("fu-nav", nav, nav.includes("STOP") ? "bad" : nav.includes("AVOID") || nav.includes("SIDE") ? "warn" : "ok");
         const p = d.person;
@@ -710,7 +714,13 @@ document.addEventListener("DOMContentLoaded", () => {
                 canvas.width = shownBitmap.width;
                 canvas.height = shownBitmap.height;
             }
-            ctx2d.drawImage(shownBitmap, 0, 0);
+            if (camMirror) {                       // the vision process flips the frame; show the same picture
+                ctx2d.save(); ctx2d.translate(canvas.width, 0); ctx2d.scale(-1, 1);
+                ctx2d.drawImage(shownBitmap, 0, 0);
+                ctx2d.restore();
+            } else {
+                ctx2d.drawImage(shownBitmap, 0, 0);
+            }
             drawOverlay(canvas.width, canvas.height);
         }
         requestAnimationFrame(paint);
@@ -774,7 +784,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
     const charts = [];
     const mk = (id, opts) => { const el = document.getElementById(id); if (el) charts.push(new V.TimeChart(el, opts)); };
-    mk("ch-range", { series: [{ key: "range", label: "range", color: V.SERIES.actual }], refs: [{ key: "desired", label: "set" }],
+    mk("ch-range", { series: [{ key: "range", label: "range", color: V.SERIES.actual }], refs: [{ key: "desired", label: "target" }],
                      band: { lo: "stop", hi: "resume", label: "wait band" }, min: 0.5, max: 2.0, unit: " m", digits: 2 });
     mk("ch-v", { series: [{ key: "v", label: "actual", color: V.SERIES.actual }, { key: "v_cmd", label: "commanded", color: V.SERIES.commanded, dash: [5, 3] }],
                  min: 0, max: 0.25, unit: " m/s", digits: 2 });
@@ -794,15 +804,22 @@ document.addEventListener("DOMContentLoaded", () => {
 
     function updateAnalysis(d) {
         if (fsmSvg) {
-            const extra = d.fusion && d.fusion.lidar_only ? "(tracking on LiDAR only)" : "";
-            V.updateFSM(fsmSvg, d.target_state, extra);
+            let extra = d.fusion && d.fusion.lidar_only ? "(tracking on LiDAR only)" : "";
+            if (d.owner_enrolled && d.following_enabled === false && !d.safety_latched) extra = "PAUSED: following is off. Raise one hand (FOLLOW ME) or press START.";
+            else if ((d.robot_telemetry || {}).mode === "MANUAL") extra += "  [MANUAL mode: autonomous commands ignored]";
+            V.updateFSM(fsmSvg, d.target_state, extra, d.follow_state);
         }
         if (banner) {
             let msg = null, cls = "";
             if (d.video_lost || (d.connected === false && d.source_mode !== "sim")) { msg = "VIDEO LOST: robot stopped until camera frames return"; cls = "critical"; }
+            else if (d.sensor_fault) { msg = "SENSOR FAULT: LiDAR stopped sending scans. Robot stopped until it returns (check the LDS-02 cable / driver on the Pi)."; cls = "critical"; }
             else if (d.safety_latched) { msg = "STOP LATCHED: owner raises one hand (FOLLOW ME) or press START to resume"; cls = "critical"; }
+            else if (d.mirror_suspect) { msg = "LEFT/RIGHT MISMATCH: the LiDAR keeps finding you on the mirror side of the camera. Stand to the robot's right: if the video shows you on the left, tick Camera mirrored; if the LiDAR map shows you on the left, tick LiDAR mirrored (LIVE SETTINGS)."; cls = "critical"; }
             else if (d.ambiguous) { msg = "TWO LOOK-ALIKES: holding still until they separate"; cls = "warning"; }
             else if ((d.robot_telemetry || {}).emergency_stop) { msg = "E-STOP: press AUTO FOLLOW to release"; cls = "critical"; }
+            else if (d.owner_enrolled && (d.robot_telemetry || {}).mode === "MANUAL") { msg = "MANUAL MODE: following is off (any W/A/S/D key or D-pad switches to manual). Press AUTO FOLLOW or START."; cls = "warning"; }
+            else if (d.owner_enrolled && d.following_enabled === false) { msg = "FOLLOWING PAUSED: raise one hand (FOLLOW ME) or press START"; cls = "warning"; }
+            else if (d.hold_to_follow && d.target_state === "AWAITING_FOLLOW_GESTURE") { msg = "RAISE A HAND ABOVE YOUR SHOULDER TO MAKE ME FOLLOW. Lower it to stop."; cls = "info"; }
             banner.hidden = !msg;
             if (msg) { banner.textContent = msg; banner.className = "alert-banner " + cls; }
         }

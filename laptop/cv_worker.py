@@ -132,7 +132,8 @@ def run_cv(jpeg_q, out_q, cmd_q, reply_q):
                 video_lost = True
                 engine.robot.update_auto_commands(0.0, 0.0, can_move=False)
                 engine._log_event("VIDEO_LOST", "No camera frames. Robot stopped; it resumes when video returns.")
-                _publish(out_q, {"video_lost": True, "events": list(engine.event_log[-12:]),
+                _publish(out_q, {"video_lost": True, "target_state": Config.STATE_SENSOR_FAULT,
+                                 "nav_status": "VIDEO_LOST", "events": list(engine.event_log[-12:]),
                                  "robot_telemetry": engine.robot.get_telemetry(), "pose_fps": 0.0,
                                  "phase2_cmd_vel": {"linear_x": 0.0, "angular_z": 0.0}})
             continue
@@ -163,6 +164,8 @@ def run_cv(jpeg_q, out_q, cmd_q, reply_q):
         frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
         if frame is None:
             continue
+        if Config.CAM_MIRROR:
+            frame = cv2.flip(frame, 1)     # undo a selfie-style camera; the dashboard flips its picture to match
 
         try:
             tel, _annotated = engine.process_frame(frame, t_frame)

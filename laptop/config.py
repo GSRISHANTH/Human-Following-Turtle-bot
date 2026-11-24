@@ -54,6 +54,19 @@ class Config:
     STATE_SAFETY_STOP = "SAFETY_STOP"
     STATE_MANUAL_CONTROL = "MANUAL_CONTROL"
     STATE_OWNER_RELEASED = "OWNER_RELEASED"
+    STATE_AWAITING_GESTURE = "AWAITING_FOLLOW_GESTURE"   # owner in view, hand down: stay, keep them centred
+    STATE_LIDAR_GUIDED = "LIDAR_GUIDED_SEARCH"           # owner out of the camera, LiDAR still has them
+    STATE_PAUSED = "PAUSED"                              # operator paused following (dashboard PAUSE / WAIT gesture)
+    STATE_OWNER_LOST = "OWNER_LOST"                      # search exhausted (360 done or timed out): stationary
+    STATE_SENSOR_FAULT = "SENSOR_FAULT"                  # display override: LiDAR silent or no camera frames
+    RELEASED_SHOW_SEC = 2.0                              # OWNER_RELEASED is shown this long, then IDLE
+
+    # --- Hold-to-follow ---
+    # The robot drives only while the owner holds a hand above shoulder level. Hand down: it stays put and keeps
+    # the owner centred (no search). Search only once the owner is lost from the camera, guided by the LiDAR.
+    FOLLOW_REQUIRES_RAISED_HAND = True
+    RAISE_CONFIRM_FRAMES = 3      # consecutive frames with the hand up before driving
+    FOLLOW_RELEASE_SEC = 0.6      # hand down this long before stopping (detection flicker does not stutter)
 
     # --- Target Loss & Active Search ---
     SEARCH_ROTATION_SPEED = 0.60          # Slow, safe search angular velocity (rad/s)
@@ -71,13 +84,13 @@ class Config:
     # --- PID & Velocity Control Limits ---
     MAX_LINEAR_VEL = 0.22         # Physical limit for TurtleBot3 Burger (m/s)
     MIN_ROLLING_VEL = 0.08        # Minimum speed to overcome static carpet/tile wheel friction (m/s)
-    MAX_ANGULAR_VEL = 2.00        # Maximum angular velocity (rad/s)
+    MAX_ANGULAR_VEL = 2.50        # rad/s (Burger hardware limit 2.84)
     STEERING_DEADZONE = 0.05      # ±5% normalized horizontal deadzone
     ANGULAR_DEADZONE = STEERING_DEADZONE  # Compatibility alias
     
     # Slew-rate acceleration limits
     MAX_ACCEL_LINEAR = 1.60       # m/s^2
-    MAX_ACCEL_ANGULAR = 8.00      # rad/s^2
+    MAX_ACCEL_ANGULAR = 12.0      # rad/s^2: snappy turns toward a person who steps sideways
 
     # --- Camera geometry and LiDAR fusion ---
     CAMERA_HFOV_DEG = 57.0        # horizontal field of view; focal length in px = (w/2)/tan(hfov/2)
@@ -89,6 +102,11 @@ class Config:
     LIDAR_HEIGHT_M = 0.17         # LDS-02 scan plane above the floor (Burger top plate)
     CAM_YAW_DEG = 0.0             # + = camera looks to the left of the robot axis
     CAM_PITCH_DEG = 0.0           # + = camera tilted down
+    # Sensor orientation fixes. Check: stand 1.5 m to the robot's RIGHT. In the live view you must appear on the
+    # RIGHT of the image (else CAM_MIRROR), and in the LiDAR map to the right of the robot icon (else LIDAR_MIRROR).
+    CAM_MIRROR = False            # camera delivers a selfie-style (horizontally flipped) image
+    LIDAR_MIRROR = False          # scan is clockwise instead of ROS counter-clockwise
+    LIDAR_YAW_DEG = 0.0           # LiDAR zero direction is rotated this much (+ = to the left) from robot forward
 
     # Monocular range: real body sizes (m). Range = f_px * size / pixels * DISTANCE_SCALE.
     # With the 57 deg HFOV these give the same ranges as the earlier px*m constants (235, 160, 230, 320 at 640 px).
@@ -108,7 +126,8 @@ class Config:
     REACQ_RELATIVE = 0.60         # ...and 60% of what the owner normally scores while tracked
     REACQ_CONFIRM_FRAMES = 5
     TRACK_RELATIVE = 0.50         # while the track is alive: position continuity is the main evidence
-    LIDAR_TRACK_MAX_SEC = 12.0    # keep following on LiDAR alone this long when the camera cannot see the owner
+    LIDAR_TRACK_MAX_SEC = 4.0     # trust a LiDAR-only track this long without the camera confirming it (a chair leg
+                                  # near the prediction looks like a person's leg; a long leash drives straight at it)
     LIDAR_TRACK_GATE_M = 0.50     # LiDAR person-cluster must be this close to where the EKF expects the owner
     MEMORY_PURSUIT_SEC = 25.0     # drive to where the owner was last seen (around obstacles) for up to this long
     MEMORY_SPEED = 0.15           # m/s while recalling, slower than following because nobody is in view
@@ -117,16 +136,36 @@ class Config:
     SEARCH_SCAN_SPEED = 0.80      # rad/s during the full-circle scan
     SEARCH_MEMORY_SEC = 30.0      # how long the EKF keeps coasting the owner while searching
     MIN_FOLLOW_DISTANCE = 0.60    # the dashboard cannot set the follow distance below this
-    EKF_LEAD_SEC = 0.35           # steer toward where the person will be, not where they were
+    EKF_LEAD_SEC = 0.45           # steer toward where the person will be, not where they were
 
     # --- PID follow controller (tuned in tests/test_follow_sim.py) ---
     PID_DIST_KP = 0.45
     PID_DIST_KI = 0.04
     PID_DIST_KD = 0.20
-    PID_TURN_KP = 2.20
+    PID_TURN_KP = 3.00
     PID_TURN_KI = 0.05
     PID_TURN_KD = 0.35
     PID_FF_GAIN = 0.80            # feed-forward on the person's speed along the line of sight
+    PID_TURN_FF = 0.80            # feed-forward on the person's own angular rate about the robot (turns with them)
+    FACE_TURN_GAIN = 2.0          # stationary (waiting): turn to keep the owner centred
+    FACE_TURN_MAX = 1.5
+    # Owner just lost: turn at once toward where the EKF (LiDAR + camera motion) says they went, and if they were
+    # walking and no map plan exists, drive toward their extrapolated position before falling back to the search.
+    PREDICT_TURN_GAIN = 2.0
+    PREDICT_TURN_MAX = 1.5
+    PREDICT_MIN_SPEED = 0.15      # m/s: below this the owner was standing, so there is no direction to follow
+    PREDICT_PURSUIT_SEC = 8.0
+    # Lost-owner recovery (Do Hoang et al., URAI 2017): rotate toward where they went, sweep, full 360, then stop.
+    # Driving to the last-seen / predicted position is optional, off by default: rotating finds a person who stepped
+    # aside, driving blind toward a remembered LiDAR point does not.
+    RECOVERY_DRIVE_TO_LAST_SEEN = False
+
+    # --- Dynamic following distance (grows with the owner's speed and with tracking uncertainty) ---
+    DIST_SPEED_GAIN = 0.5         # s of time headway: +0.5 m at 1 m/s
+    DIST_CONF_GAIN = 0.35         # m added at the lowest tracking confidence
+    DIST_MAX_EXTRA = 0.6          # never more than this beyond the operator's set distance
+    # --- Sensor health ---
+    LIDAR_FAULT_SEC = 1.5         # LiDAR was streaming and has gone silent this long: stop (sensor abnormality)
     PID_MIN_V = 0.06
     STEERING_DEADZONE_DEG = 2.0
 
@@ -162,9 +201,10 @@ class Config:
 
     # Settings the dashboard may change live (and save to config.local.json).
     TUNABLE = ("DESIRED_DISTANCE", "DISTANCE_SCALE", "CAMERA_HFOV_DEG", "CAM_X_M", "CAM_Y_M", "CAM_HEIGHT_M",
-               "LIDAR_HEIGHT_M", "CAM_YAW_DEG", "CAM_PITCH_DEG", "MAX_LINEAR_VEL", "MAX_ANGULAR_VEL",
+               "LIDAR_HEIGHT_M", "CAM_YAW_DEG", "CAM_PITCH_DEG", "CAM_MIRROR", "LIDAR_MIRROR", "LIDAR_YAW_DEG", "MAX_LINEAR_VEL", "MAX_ANGULAR_VEL",
                "PID_DIST_KP", "PID_DIST_KI", "PID_DIST_KD", "PID_TURN_KP", "PID_TURN_KI", "PID_TURN_KD",
-               "PID_FF_GAIN", "IDENTITY_MATCH_THRESHOLD", "REACQ_THRESHOLD", "PI_IP")
+               "FOLLOW_REQUIRES_RAISED_HAND", "RECOVERY_DRIVE_TO_LAST_SEEN", "DIST_SPEED_GAIN", "DIST_CONF_GAIN",
+               "PID_FF_GAIN", "PID_TURN_FF", "MAX_ACCEL_ANGULAR", "IDENTITY_MATCH_THRESHOLD", "REACQ_THRESHOLD", "PI_IP")
 
     @classmethod
     def coerce(cls, name, value):

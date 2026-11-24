@@ -52,7 +52,7 @@ JPEG_QUALITY = 50
 CMD_TIMEOUT = 0.35  # about ten missed packets at 30 Hz
 PEER_TIMEOUT = 3.0
 MAX_LINEAR = 0.22   # TurtleBot3 Burger limits
-MAX_ANGULAR = 2.20
+MAX_ANGULAR = 2.84  # Burger hardware limit; the laptop's MAX_ANGULAR_VEL is the working limit
 
 ROS_MODE = None  # 'ROS1', 'ROS2', or None
 ros_cmd_pub = None

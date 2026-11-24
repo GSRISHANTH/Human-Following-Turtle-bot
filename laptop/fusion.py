@@ -84,7 +84,7 @@ def box_range(proj, sel, near=None, band=0.35):
         return None, 0
     r = proj["r"][sel]
     if near is not None and near > 0:
-        r = r[np.abs(r - near) < 0.4 * max(near, 0.5)]
+        r = r[np.abs(r - near) < 0.5 * max(near, 0.5)]
         if len(r) == 0:
             return None, 0
     r = np.sort(r)
