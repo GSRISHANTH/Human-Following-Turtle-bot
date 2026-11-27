@@ -1,5 +1,0 @@
-2026/11/27-00:45:57.349 3804 Creating DB C:\Studies\7th sem\Embedded Systems for Robotics\Project\human-following-laptop\build_assets\edge_tmp\Default\EdgeCoupons/coupons_data.db since it was missing.
-2026/11/27-00:45:57.383 3804 Reusing MANIFEST C:\Studies\7th sem\Embedded Systems for Robotics\Project\human-following-laptop\build_assets\edge_tmp\Default\EdgeCoupons/coupons_data.db/MANIFEST-000001
-2026/11/27-00:45:57.937 2368 Level-0 table #5: started
-2026/11/27-00:45:57.941 2368 Level-0 table #5: 683284 bytes OK
-2026/11/27-00:45:57.943 2368 Delete type=0 #3

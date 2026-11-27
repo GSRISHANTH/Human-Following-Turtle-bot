@@ -52,3 +52,16 @@ ehthumbs.db
 # Local settings written by the dashboard (Save) or by hand; see config.example.json
 config.local.json
 config.local.json.tmp
+
+# Reports (kept on your machine, not in the repository)
+report/
+*.docx
+PROJECT_REPORT.md
+~$*
+
+# Saved images. Only the README media is committed.
+*.png
+*.jpg
+*.jpeg
+*.gif
+!docs/media/*
