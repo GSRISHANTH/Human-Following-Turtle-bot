@@ -438,7 +438,7 @@ s8 = prs.slides.add_slide(blank_layout)
 add_header(s8, "5. System Design (3/3): 16-State FSM, Gestures & Safety", "Deterministic Behavior Transitions & Multi-Layer Interlocks", 8)
 
 if os.path.exists("build_assets/dashboard_fsm.png"):
-    s8.shapes.add_picture("build_assets/dashboard_fsm.png", Inches(0.55), Inches(1.22), width=Inches(5.55))
+    s8.shapes.add_picture("build_assets/dashboard_fsm.png", Inches(0.55), Inches(1.25), width=Inches(5.55))
 elif os.path.exists("build_assets/fig_fsm.png"):
     s8.shapes.add_picture("build_assets/fig_fsm.png", Inches(0.50), Inches(1.22), width=Inches(8.15))
 
@@ -477,11 +477,11 @@ s9 = prs.slides.add_slide(blank_layout)
 add_header(s9, "6. Implementation (1/2): Software Stack & Web Dashboard", "Custom UDP Protocol, Modular Python Architecture & Live UI", 9)
 
 if os.path.exists("build_assets/dashboard_top.png"):
-    s9.shapes.add_picture("build_assets/dashboard_top.png", Inches(0.55), Inches(1.25), width=Inches(5.35))
+    s9.shapes.add_picture("build_assets/dashboard_top.png", Inches(0.55), Inches(1.25), height=Inches(2.75))
 if os.path.exists("build_assets/dashboard_fsm_view.png"):
-    s9.shapes.add_picture("build_assets/dashboard_fsm_view.png", Inches(0.55), Inches(4.78), width=Inches(5.35))
+    s9.shapes.add_picture("build_assets/dashboard_fsm_view.png", Inches(0.55), Inches(4.12), height=Inches(2.75))
 
-add_card(s9, 6.10, 1.25, 6.68, 5.65,
+add_card(s9, 5.15, 1.25, 7.63, 5.62,
          title="Web Dashboard & UDP Implementation",
          bullets=[
              ("Live AI & RViz Panels (Top Left):", "Displays live camera/simulation feed with MediaPipe skeleton & LiDAR laser curtain alongside real-time 0.05 m occupancy grid, robot pose, and A* path."),
@@ -490,7 +490,7 @@ add_card(s9, 6.10, 1.25, 6.68, 5.65,
              ("pi/ (Thin Node):", "pi_turtlebot_node.py, tb_proto.py, start_robot.sh (ROS 2 Humble, domain 30)."),
              ("Binary UDP Protocol:", "Header '!2sBIHHd' (magic 'TB'); <=1200 B JPEG chunks on :5000 (newest frame wins); V:vx,W:wz,S:seq @ 30 Hz on :8888."),
          ],
-         fill_rgb=LIGHT_BG, font_size=11.5, title_size=13.5)
+         fill_rgb=LIGHT_BG, font_size=12, title_size=14)
 
 
 # ===========================================================================
