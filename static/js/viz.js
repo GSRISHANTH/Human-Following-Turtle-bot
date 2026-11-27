@@ -237,13 +237,13 @@
         PAUSED: [574, 50, "PAUSED"],
         OWNER_RELEASED: [4, 150, "RELEASED"], SENSOR_FAULT: [194, 150, "SENSOR FAULT"], FOLLOWING: [384, 150, "FOLLOWING"],
         WAIT_FOR_OWNER_MOVEMENT: [574, 150, "WAIT (CLOSE)"],
-        RECALLING_LAST_POSITION: [4, 250, "RECALL (OPTION)"], TARGET_TEMPORARILY_LOST: [194, 250, "TEMP. LOST"],
+        RECALLING_LAST_POSITION: [4, 250, "RECALL (MAP)"], TARGET_TEMPORARILY_LOST: [194, 250, "TEMP. LOST"],
         LIDAR_GUIDED_SEARCH: [384, 250, "LIDAR-GUIDED"], SAFETY_STOP: [574, 250, "SAFETY STOP"],
         OWNER_LOST: [4, 350, "OWNER LOST"], SEARCH_ROTATING: [194, 350, "SEARCH 360"], MANUAL_CONTROL: [384, 350, "MANUAL"],
         TARGET_AMBIGUOUS: [574, 350, "AMBIGUOUS"],
     };
     const OVERRIDE = new Set(["SENSOR_FAULT", "SAFETY_STOP", "MANUAL_CONTROL", "TARGET_AMBIGUOUS"]);
-    const OPTIONAL = new Set(["RECALLING_LAST_POSITION"]);
+    const OPTIONAL = new Set();
     const NW = 118, NH = 34;
     // [from, to, label, bend (+ = bow left of travel), label dx, dy, text-anchor, dotted]
     const EDGES = [
@@ -257,10 +257,10 @@
         ["FOLLOWING", "LIDAR_GUIDED_SEARCH", "out of camera", 16, -6, 2, "end"],
         ["LIDAR_GUIDED_SEARCH", "FOLLOWING", "camera back", 16, 6, 2, "start"],
         ["LIDAR_GUIDED_SEARCH", "TARGET_TEMPORARILY_LOST", "LiDAR lost / 4 s", 0, 0, -8],
-        ["TARGET_TEMPORARILY_LOST", "SEARCH_ROTATING", "0.4 s turn", 0, 6, 4, "start"],
+        ["TARGET_TEMPORARILY_LOST", "SEARCH_ROTATING", "no map path", 0, 6, 4, "start"],
         ["SEARCH_ROTATING", "OWNER_LOST", "360° / 30 s", 0, 0, -8],
-        ["TARGET_TEMPORARILY_LOST", "RECALLING_LAST_POSITION", "if enabled", 0, 0, -8, null, true],
-        ["RECALLING_LAST_POSITION", "SEARCH_ROTATING", "empty / 25 s", 0, -4, 0, "end", true],
+        ["TARGET_TEMPORARILY_LOST", "RECALLING_LAST_POSITION", "turn, then route", 0, 0, -8],
+        ["RECALLING_LAST_POSITION", "SEARCH_ROTATING", "empty / 25 s", 0, -4, 0, "end"],
         ["OWNER_RELEASED", "IDLE", "2 s", 0, 6, 4, "start"],
     ];
     const WHY = {
@@ -270,10 +270,10 @@
         PAUSED: "Following paused from the dashboard. Stationary (still facing the owner). Press START to arm it again.",
         FOLLOWING: "Hand is up: PID on the EKF range and bearing, LiDAR avoidance on top. Distance adapts to speed and confidence.",
         WAIT_FOR_OWNER_MOVEMENT: "Owner inside the stop distance with the hand up: stationary, facing them; resumes when they move beyond the resume distance.",
-        LIDAR_GUIDED_SEARCH: "Owner out of the camera but on the LiDAR: rotating toward them to bring them back into view. Never drives blind.",
-        TARGET_TEMPORARILY_LOST: "Owner just lost by camera and LiDAR: turning toward where they were heading.",
+        LIDAR_GUIDED_SEARCH: "Owner out of the camera but on the LiDAR: rotates toward them first; once facing them (±25°) and they were being followed, closes in round obstacles.",
+        TARGET_TEMPORARILY_LOST: "Owner just lost by camera and LiDAR: turning toward where they were heading while the route to their last position is planned.",
         SEARCH_ROTATING: "Rotate to find: predicted direction, widening sweep (±110°), then a full 360°.",
-        RECALLING_LAST_POSITION: "Optional recall (RECOVERY_DRIVE_TO_LAST_SEEN): driving to the remembered spot with A* and LiDAR avoidance.",
+        RECALLING_LAST_POSITION: "Owner out of sight: routing round obstacles (A* on the LiDAR map, replanned 4x/s, LiDAR avoidance) to within 0.8 m of where they were last seen, turning in place on sharp bends. The LiDAR or camera re-acquires them on the way.",
         OWNER_LOST: "Search finished without finding the owner. Stopped; it re-acquires them as soon as they reappear.",
         TARGET_AMBIGUOUS: "Two people match the owner equally. Holding still until they separate.",
         SAFETY_STOP: "Latched stop (STOP gesture) or E-STOP. Owner's FOLLOW ME or START clears the latch; AUTO FOLLOW releases E-STOP.",
@@ -288,7 +288,7 @@
         const ns = "http://www.w3.org/2000/svg";
         svg.innerHTML = `<defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="${INK.muted}"/></marker></defs>`;
         ["Overrides (dashed, from any state): STOP / E-STOP → SAFETY STOP · LiDAR or video loss → SENSOR FAULT ·",
-         "teleop → MANUAL · look-alikes → AMBIGUOUS · RELEASE → RELEASED.  Owner seen again in SEARCH / OWNER LOST → AWAIT HAND UP"]
+         "teleop → MANUAL · look-alikes → AMBIGUOUS · RELEASE → RELEASED.  Owner re-found in RECALL / SEARCH / LOST → LIDAR-GUIDED or AWAIT"]
             .forEach((line, i) => {
                 const note = document.createElementNS(ns, "text");
                 note.setAttribute("x", 4); note.setAttribute("y", 13 + i * 14); note.setAttribute("class", "fsm-edge-label");

@@ -163,10 +163,14 @@ class Config:
     PREDICT_TURN_MAX = 1.5
     PREDICT_MIN_SPEED = 0.15      # m/s: below this the owner was standing, so there is no direction to follow
     PREDICT_PURSUIT_SEC = 8.0
-    # Lost-owner recovery (Do Hoang et al., URAI 2017): rotate toward where they went, sweep, full 360, then stop.
-    # Driving to the last-seen / predicted position is optional, off by default: rotating finds a person who stepped
-    # aside, driving blind toward a remembered LiDAR point does not.
-    RECOVERY_DRIVE_TO_LAST_SEEN = False
+    # Lost-owner recovery (after Do Hoang et al., URAI 2017): rotate toward where they went first; if their last
+    # position is in the LiDAR map, route there with A* round obstacles (replanned at 4 Hz, LiDAR avoidance on top,
+    # turning in place whenever the route bends more than ROTATE_FIRST_DEG); then the rotating 360 search.
+    RECOVERY_DRIVE_TO_LAST_SEEN = True
+    RECALL_APPROACH_M = 0.8       # go this close to the last-seen spot (to see round the corner they went behind)
+    ROTATE_FIRST_DEG = 35.0       # route bends more than this: turn on the spot before driving
+    LIDAR_GUIDED_DRIVE = True     # LiDAR has the (followed) owner out of camera: once facing them, close in round obstacles
+    LIDAR_GUIDED_ALIGN_DEG = 25.0
 
     # --- Dynamic following distance (grows with the owner's speed and with tracking uncertainty) ---
     DIST_SPEED_GAIN = 0.5         # s of time headway: +0.5 m at 1 m/s

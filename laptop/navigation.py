@@ -206,7 +206,7 @@ class PersonMemory:
         return (self.pos[0] + self.vel[0] / speed * travel, self.pos[1] + self.vel[1] / speed * travel)
 
 
-def plan_with_memory(planner, grid, origin, pose, person, memory, now, desired):
+def plan_with_memory(planner, grid, origin, pose, person, memory, now, desired, recall_desired=None):
     """One planning step. Follows the live person when they are being measured; otherwise plans to where they
     were last seen. Returns the plan dict (with memory/goal_dist/mem_* fields) or None if there is nothing to go to."""
     if pose is None or origin is None:
@@ -222,7 +222,8 @@ def plan_with_memory(planner, grid, origin, pose, person, memory, now, desired):
         target, mem_mode = (c * dx - s * dy, s * dx + c * dy), True
     else:
         return None
-    plan = planner.plan(grid, origin, pose, target, desired)
+    # recalling: go much closer than the follow distance, to look round whatever hid them
+    plan = planner.plan(grid, origin, pose, target, recall_desired if (mem_mode and recall_desired) else desired)
     goal = plan.get("goal")
     plan.update({
         "memory": mem_mode,

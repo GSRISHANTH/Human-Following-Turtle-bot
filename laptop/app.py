@@ -164,7 +164,7 @@ def _plan_loop():
                 latest_plan = None
                 continue
             plan = plan_with_memory(planner, lidar_map.grid, lidar_map.origin, lidar_map.pose, person,
-                                    person_memory, now, Config.TARGET_DISTANCE)
+                                    person_memory, now, Config.TARGET_DISTANCE, recall_desired=Config.RECALL_APPROACH_M)
             latest_plan = plan
         if plan is None:
             continue

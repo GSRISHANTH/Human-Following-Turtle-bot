@@ -508,8 +508,8 @@ class CVPipeline:
         goal_d = plan.get("goal_dist", 1.0)
         w = 0.0 if abs(b) < math.radians(3.0) else max(-1.2, min(1.2, 0.9 * Config.PID_TURN_KP * b))
         v = min(Config.MEMORY_SPEED, 0.6 * goal_d + 0.03) * max(0.0, math.cos(min(abs(b), math.pi / 2))) ** 2
-        if abs(b) > math.radians(60.0):
-            v = 0.0
+        if abs(b) > math.radians(Config.ROTATE_FIRST_DEG):
+            v = 0.0                          # rotate toward the route first, then drive
         elif 0.0 < v < Config.MIN_ROLLING_VEL:
             v = Config.MIN_ROLLING_VEL
         status = "MEMORY_DETOUR" if blocked else "MEMORY_PURSUIT"
@@ -1007,8 +1007,14 @@ class CVPipeline:
                 # Lost from the camera, LiDAR still has them: LiDAR-guided search. Turn to bring them back into the
                 # picture; keep up with them only if they were being followed (hand up) when the camera lost them.
                 self.target_state = Config.STATE_LIDAR_GUIDED
-                v_x, w_z = 0.0, self._face_person(fused_b)     # rotate to find them; never drive blind
-                telemetry["nav_status"] = "LIDAR_GUIDED_TURN"
+                aligned = abs(fused_b) < math.radians(Config.LIDAR_GUIDED_ALIGN_DEG)
+                if (Config.LIDAR_GUIDED_DRIVE and self._raised_at_loss and aligned and dist > stop_d):
+                    # facing them: close in on the LiDAR track, round obstacles (A* waypoint + LiDAR avoidance)
+                    v_x, w_z, nav_status = self._follow_command(fused_b, fused_r, half, obs_dists, now)
+                    telemetry["nav_status"] = "LIDAR_GUIDED_" + nav_status
+                else:
+                    v_x, w_z = 0.0, self._face_person(fused_b)   # rotate toward them first
+                    telemetry["nav_status"] = "LIDAR_GUIDED_TURN"
             elif Config.FOLLOW_REQUIRES_RAISED_HAND and not self.hand_raised:
                 # Owner in view, hand down: stay put, keep them centred in the camera, never search.
                 if self.target_state != Config.STATE_AWAITING_GESTURE:

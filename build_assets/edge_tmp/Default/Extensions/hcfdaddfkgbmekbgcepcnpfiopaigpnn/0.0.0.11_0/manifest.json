@@ -1,0 +1,36 @@
+{
+   "action": {
+      "default_icon": "Logo_48.png"
+   },
+   "background": {
+      "service_worker": "rootServiceWorker.js"
+   },
+   "chrome_settings_overrides": {
+      "homepage": "https://www.bing.com/?pc=U474",
+      "search_provider": {
+         "is_default": true,
+         "prepopulated_id": 1,
+         "search_url": "https://www.bing.com/search?PC=U474&q={searchTerms}",
+         "suggest_url": "{bing:baseURL}qbox?query={searchTerms}&language={language}&PC=U474&{bing:partner}{bing:cvid}{bing:ig}{google:inputType}{google:cursorPosition}{google:pageClassification}{bing:features}{bing:flights}"
+      },
+      "startup_pages": [ "https://www.bing.com/?pc=U474" ]
+   },
+   "default_locale": "en",
+   "description": "__MSG_ExtnDescription__",
+   "host_permissions": [ "http://g.ceipmsn.com/*", "http://*.bing.com/*", "https://*.bing.com/", "http://*.microsoft.com/*", "https://*.microsoft.com/*" ],
+   "icons": {
+      "128": "Logo_128.png",
+      "16": "Logo.png",
+      "48": "Logo_48.png"
+   },
+   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAl5dPyFOJMnR8hziajzuN9F9tXfmQMheM8q1YVH3PHmeHFX9MyQnSODlzMXbN/6KF0AgYBkTbudcvY9xi5criWVw+0LoQAdxDwlUCwvMa2tlNXit0ZMvVlqR05Gns7BbjAtxOy98mFSSWD0KD60o0weUNz2d70oxj8PhVxHgp8CrHl9nnu9YwqcRIzMGVvo4gJYW04ZKpMIe7MzhxechiewzDCZZWhNWpwE5mpJwu6GszUIsnL5Kc51QD161O3hfmO9rDss0CUgmddya80cng5t7AARy2/Bs8U3xxK7h5gtbYD+dv8EBRBo74+2RtX2PcgrScUGYk29PZt8Fi3FlwuQIDAQAB",
+   "manifest_version": 3,
+   "name": "__MSG_ExtnName__",
+   "permissions": [ "cookies", "storage", "tabs", "alarms" ],
+   "update_url": "https://edge.microsoft.com/extensionwebstorebase/v1/crx",
+   "version": "0.0.0.11",
+   "web_accessible_resources": [ {
+      "matches": [  ],
+      "resources": [ "Logo.png" ]
+   } ]
+}

@@ -296,12 +296,12 @@ The machine below is the one implemented in `laptop/cv_pipeline.py` with hold-to
 | `OWNER_LOCKED` | Profile ready (just enrolled, or restored from disk); owner not seen yet this session | Stopped; never searches for someone not yet seen |
 | `AWAITING_FOLLOW_GESTURE` | Owner in view, hand below the shoulder | Rotate only, keeping the owner centred |
 | `FOLLOWING` | Owner in view, hand above the shoulder | PID + LiDAR avoidance; distance adapts (§4.6) |
-| `WAIT_FOR_OWNER_MOVEMENT` | Hand up, owner inside the stop distance | Rotate only (face the owner) |
+| `WAIT_FOR_OWNER_MOVEMENT` | Hand up, owner inside the stop distance | Face the owner; below $d^\* - 0.25$ m reverse (≤ 0.15 m/s, rear LiDAR clear ≥ 0.35 m) until the gap is restored |
 | `PAUSED` | Operator pressed PAUSE | Rotate only (face the owner); a raised hand does not override it |
-| `LIDAR_GUIDED_SEARCH` | Owner out of the camera, LiDAR still has them (≤ 4 s) | Rotate toward the LiDAR position, never drive |
+| `LIDAR_GUIDED_SEARCH` | Owner out of the camera, LiDAR still has them (≤ 4 s) | Rotate toward them; once within ±25° (and they were followed) close in with the A* detour and LiDAR avoidance |
 | `TARGET_TEMPORARILY_LOST` | Camera and LiDAR both lost the owner (first 0.4 s) | Turn toward the predicted direction |
 | `SEARCH_ROTATING` | Rotate to find | Predicted turn, then a ±110° sweep, then a full 360° |
-| `RECALLING_LAST_POSITION` | Optional (`RECOVERY_DRIVE_TO_LAST_SEEN`) | A* to the remembered spot, LiDAR avoidance |
+| `RECALLING_LAST_POSITION` | Owner out of sight, last position in the map | A* round obstacles (replanned 4 Hz) to within 0.8 m of the last-seen spot; LiDAR avoidance; turns in place on bends > 35° |
 | `OWNER_LOST` | Search exhausted (360° done or 30 s) | Stopped; re-acquires on sight |
 | `OWNER_RELEASED` | RELEASE gesture or button; profile deleted | Stopped; becomes `IDLE` after 2 s |
 
@@ -329,7 +329,7 @@ The machine below is the one implemented in `laptop/cv_pipeline.py` with hold-to
 | `FOLLOWING` / `AWAITING` | owner leaves the camera, LiDAR cluster still at the EKF prediction | `LIDAR_GUIDED_SEARCH` |
 | `LIDAR_GUIDED_SEARCH` | camera sees the owner again | `AWAITING` / `FOLLOWING` (by the hand) |
 | `LIDAR_GUIDED_SEARCH` | LiDAR loses them, or 4 s without camera confirmation | `TARGET_TEMPORARILY_LOST` |
-| `TARGET_TEMPORARILY_LOST` | 0.4 s | `SEARCH_ROTATING` (or `RECALLING_LAST_POSITION` if enabled) |
+| `TARGET_TEMPORARILY_LOST` | route to the last-seen position exists | `RECALLING_LAST_POSITION`; no map or no path: `SEARCH_ROTATING` |
 | `RECALLING_LAST_POSITION` | arrived with nobody there, no path, or 25 s | `SEARCH_ROTATING` |
 | `SEARCH_ROTATING` | 360° covered or 30 s | `OWNER_LOST` |
 | `SEARCH_ROTATING` / `OWNER_LOST` | owner re-identified (Re-ID gate, §4.3) | `AWAITING_FOLLOW_GESTURE` (search stops, owner centred) |

@@ -227,6 +227,19 @@ class HoldToFollow(_Harness):
             self.assertLess(tels[-1]["phase2_cmd_vel"]["angular_z"], 0.0, "turn right, toward the LiDAR position")
             self.assertEqual(tels[-1]["phase2_cmd_vel"]["linear_x"] > 0.0, drives)
 
+    def test_lidar_guided_closes_in_once_facing_a_followed_owner(self):
+        p = self.pipe
+        p.hand_raised, p.lidar_only, p._raised_at_loss = True, False, True
+        p.target_state = Config.STATE_FOLLOWING
+        p.set_lidar(bins_with({-10: 3.0}))                 # nearly ahead, 3 m away, out of the camera
+        now = time.time()
+        p.ekf.init(3.0, math.radians(-10), now)
+        p.last_cam_seen = now
+        tels = self.run_frames(lambda: [], 3)
+        self.assertEqual(tels[-1]["target_state"], Config.STATE_LIDAR_GUIDED)
+        self.assertGreater(tels[-1]["phase2_cmd_vel"]["linear_x"], 0.0, "facing them and they are far: close in")
+        self.assertTrue(tels[-1]["nav_status"].startswith("LIDAR_GUIDED_"))
+
     def test_found_again_during_search_stops_and_waits_for_the_hand(self):
         p = self.pipe
         p.hand_raised = False

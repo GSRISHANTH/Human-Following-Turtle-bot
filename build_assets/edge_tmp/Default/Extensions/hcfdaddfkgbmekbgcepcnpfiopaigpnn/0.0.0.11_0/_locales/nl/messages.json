@@ -1,0 +1,18 @@
+{
+   "ExtnDescription": {
+      "Description": "Extension Description",
+      "message": "Stel Microsoft Bing in als uw standaardstartpagina en zoekmachine"
+   },
+   "ExtnMarket": {
+      "Description": "Market",
+      "message": "nl-nl"
+   },
+   "ExtnName": {
+      "Description": "Extension name",
+      "message": "Microsoft Bing Homepage and Search Engine"
+   },
+   "HomePage": {
+      "Description": "Homepage",
+      "message": "&mkt=nl-NL"
+   }
+}

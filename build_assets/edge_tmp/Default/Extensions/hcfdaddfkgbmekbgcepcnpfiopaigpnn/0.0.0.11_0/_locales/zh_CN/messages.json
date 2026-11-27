@@ -1,0 +1,18 @@
+{
+   "ExtnDescription": {
+      "Description": "Extension Description",
+      "message": "Set Microsoft Bing as your default homepage and search engine"
+   },
+   "ExtnMarket": {
+      "Description": "Market",
+      "message": "zh-cn"
+   },
+   "ExtnName": {
+      "Description": "Extension name",
+      "message": "Microsoft Bing Homepage and Search Engine"
+   },
+   "HomePage": {
+      "Description": "Homepage",
+      "message": "&mkt=zh-CN"
+   }
+}

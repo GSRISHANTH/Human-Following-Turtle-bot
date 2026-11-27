@@ -1,0 +1,18 @@
+{
+   "ExtnDescription": {
+      "Description": "Extension Description",
+      "message": "Microsoft Bing を既定のホームページと検索エンジンとして設定"
+   },
+   "ExtnMarket": {
+      "Description": "Market",
+      "message": "ja-jp"
+   },
+   "ExtnName": {
+      "Description": "Extension name",
+      "message": "Microsoft Bing ホームページと検索エンジン"
+   },
+   "HomePage": {
+      "Description": "Homepage",
+      "message": "&mkt=ja-JP"
+   }
+}

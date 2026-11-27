@@ -427,8 +427,9 @@ It takes about 11 ms per scan. People and moving objects are kept out of the map
 |---|---|
 | Hold one hand **above your shoulder** | Follows. It starts after 3 frames with the hand up. |
 | Lower your hand | Stops after 0.6 s, then stays put and keeps turning to keep you centred (`AWAITING_FOLLOW_GESTURE`). It never searches. |
-| Walk out of the camera's view while the LiDAR still sees you | `LIDAR_GUIDED_SEARCH`: **rotates** toward your LiDAR position to bring you back into view. It never drives blind, and the LiDAR-only track expires after 4 s without camera confirmation. |
-| Disappear from both camera and LiDAR | **Rotate to find:** turns at once toward where you went, sweeps wider (±110°), does a full 360°, then stops. Driving to the last-seen spot is optional (`RECOVERY_DRIVE_TO_LAST_SEEN`, off by default). |
+| Walk out of the camera's view while the LiDAR still sees you | `LIDAR_GUIDED_SEARCH`: **rotates** toward your LiDAR position first. Once facing you (±25°), and if you were being followed, it closes in **round obstacles** (A* detour plus LiDAR avoidance). The LiDAR-only track expires after 4 s without camera confirmation. |
+| Disappear from both camera and LiDAR | It **turns toward where you went**. It then **routes round obstacles on the LiDAR map** to within 0.8 m of your last position: A* replanned 4×/s, LiDAR avoidance on top, turning in place whenever the route bends more than 35°. If you're not there, it does the rotating 360° search, then stops. Set `RECOVERY_DRIVE_TO_LAST_SEEN` off to rotate only. |
+| Walk up closer than ~1.75 m | **Backs off** to restore 2 m, facing you. It only reverses with a live LiDAR and at least 0.35 m clear behind; the controller has a 0.20 m rear hard stop. |
 | Reappear during the search | The search stops, it centres you and waits for your hand. |
 | Both hands up | STOP (latched), from anyone. |
 
